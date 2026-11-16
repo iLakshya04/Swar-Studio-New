@@ -5,6 +5,33 @@ interface McpConnectPanelProps {
   serverAppUrl: string | null;
 }
 
+const CREATOR_TOOLS_SUMMARY = [
+  {
+    name: 'generate_speech',
+    summary: '48 kHz mono/stereo WAV, MP3/M4A/FLAC, native file handoff, wordTimings, speechEnvelope, target duration',
+  },
+  {
+    name: 'generate_subtitles',
+    summary: 'Direct .SRT, .VTT, .ASS (Rainbow Reels white + cyan #00E5FF active word), and word-timing JSON',
+  },
+  {
+    name: 'generate_speech_segments & regenerate_segment',
+    summary: 'Per-line [CURIOUS]/[AWE] synthesis + re-stitching a single sentence without redoing the clip',
+  },
+  {
+    name: 'add_pronunciation / list_pronunciations',
+    summary: 'Shared English & Hindi phonetic/IPA dictionary applied cleanly without altering captions',
+  },
+  {
+    name: 'localize_narration & generate_dialogue',
+    summary: 'Duration-matched EN -> Hindi/Hinglish dubs + 2–6 speaker dialogues with optional speaker stems',
+  },
+  {
+    name: 'transcribe_audio, dub_audio, match_duration, analyze_voice, replace_segment',
+    summary: 'Accepts native ChatGPT audioFile uploads (openai/fileParams) or Svara clipIds',
+  },
+];
+
 export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
   const origin =
     typeof window !== 'undefined'
@@ -43,27 +70,40 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
     }
   };
 
-  const runMcpRpcTest = async (method: 'tools/list' | 'tools/call') => {
+  const runMcpRpcTest = async (
+    action: 'tools/list' | 'list_voices' | 'list_pronunciations' | 'initialize'
+  ) => {
     setIsTesting(true);
     setTestError(null);
     try {
       const rpcBody =
-        method === 'tools/list'
+        action === 'initialize'
           ? {
               jsonrpc: '2.0',
               id: Date.now(),
-              method: 'tools/list',
-              params: {},
-            }
-          : {
-              jsonrpc: '2.0',
-              id: Date.now(),
-              method: 'tools/call',
+              method: 'initialize',
               params: {
-                name: 'list_voices',
-                arguments: { language: 'Hindi' },
+                protocolVersion: '2025-03-26',
+                capabilities: {},
+                clientInfo: { name: 'svara-inspector', version: '1.0.0' },
               },
-            };
+            }
+          : action === 'tools/list'
+            ? {
+                jsonrpc: '2.0',
+                id: Date.now(),
+                method: 'tools/list',
+                params: {},
+              }
+            : {
+                jsonrpc: '2.0',
+                id: Date.now(),
+                method: 'tools/call',
+                params: {
+                  name: action,
+                  arguments: action === 'list_voices' ? { language: 'Hindi' } : {},
+                },
+              };
 
       const res = await fetch('/mcp', {
         method: 'POST',
@@ -92,10 +132,10 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="space-y-1">
             <h2 className="text-base font-semibold text-[#0F172A] dark:text-slate-100">
-              Remote MCP Endpoints
+              Remote Creator Speech MCP Endpoints
             </h2>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Expose Svara Studio&apos;s English &amp; Hindi voices directly to ChatGPT and Claude over Model Context Protocol.
+              Returns native MCP audio file resources/links, 48 kHz normalized WAVs, word timestamps, Rainbow Reels .ASS captions, and supports ChatGPT file uploads.
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -165,9 +205,16 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
           </div>
         </div>
 
-        <p className="text-xs text-slate-500 dark:text-slate-400">
-          When sharing externally with ChatGPT or Claude.ai, publish this app in Google AI Studio so your public Shared App URL handles remote HTTPS requests without private preview auth.
-        </p>
+        <div className="pt-3 border-t border-slate-100 dark:border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-3">
+          {CREATOR_TOOLS_SUMMARY.map((t) => (
+            <div key={t.name} className="text-xs space-y-0.5">
+              <p className="font-mono font-semibold text-[#0F172A] dark:text-slate-100">
+                {t.name}
+              </p>
+              <p className="text-slate-500 dark:text-slate-400">{t.summary}</p>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -257,15 +304,24 @@ Auth: None`}
               Live MCP Endpoint Verification
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Send real JSON-RPC 2.0 requests to <code className="font-mono">/mcp</code> to verify exposed tools (<code className="font-mono">list_voices</code>, <code className="font-mono">generate_speech</code>, <code className="font-mono">generate_dialogue</code>, <code className="font-mono">translate_tts_script</code>).
+              Send live JSON-RPC 2.0 requests to <code className="font-mono">/mcp</code> to verify all 27 tools, workflow instructions, and pronunciation dictionary.
             </p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={isTesting}
+              onClick={() => runMcpRpcTest('initialize')}
+              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>Test initialize</span>
+            </button>
             <button
               type="button"
               disabled={isTesting}
               onClick={() => runMcpRpcTest('tools/list')}
-              className="inline-flex items-center gap-1.5 px-3.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors whitespace-nowrap"
             >
               <Play className="w-3.5 h-3.5" />
               <span>Test tools/list</span>
@@ -273,11 +329,20 @@ Auth: None`}
             <button
               type="button"
               disabled={isTesting}
-              onClick={() => runMcpRpcTest('tools/call')}
-              className="inline-flex items-center gap-1.5 px-3.5 h-9 rounded-lg bg-[#2563EB] text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+              onClick={() => runMcpRpcTest('list_pronunciations')}
+              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors whitespace-nowrap"
             >
               <Play className="w-3.5 h-3.5" />
-              <span>Run list_voices (Hindi)</span>
+              <span>Pronunciations</span>
+            </button>
+            <button
+              type="button"
+              disabled={isTesting}
+              onClick={() => runMcpRpcTest('list_voices')}
+              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-[#2563EB] text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>Run list_voices</span>
             </button>
           </div>
         </div>

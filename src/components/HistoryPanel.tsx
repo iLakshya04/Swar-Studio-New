@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Download, Mic2, Play, RotateCcw, Search, Trash2 } from 'lucide-react';
-import type { HistoryItem } from '../types';
+import { Captions, Download, Mic2, Play, RotateCcw, Search, Trash2 } from 'lucide-react';
+import type { HistoryItem, SubtitleFormat } from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
+import { generateSubtitles } from '../utils/subtitleGenerator';
 
 interface HistoryPanelProps {
   items: HistoryItem[];
@@ -34,17 +35,51 @@ export function HistoryPanel({
     );
   });
 
-  const handleDownloadItem = (item: HistoryItem) => {
-    const binary = atob(item.audioBase64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
+  const handleDownloadWav = (item: HistoryItem) => {
+    const safeName =
+      item.voiceLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') ||
+      'svara-clip';
+
+    if (item.audioBase64) {
+      const binary = atob(item.audioBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `svara-${safeName}.wav`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+      return;
     }
-    const blob = new Blob([bytes], { type: 'audio/wav' });
+
+    if (item.clipId) {
+      const anchor = document.createElement('a');
+      anchor.href = `/api/clips/${item.clipId}.wav?download=1`;
+      anchor.download = `svara-${safeName}.wav`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    }
+  };
+
+  const handleDownloadSubtitles = (item: HistoryItem, format: SubtitleFormat) => {
+    if (!item.wordTimings?.length) return;
+    const subText = generateSubtitles({
+      wordTimings: item.wordTimings,
+      format,
+      preset: 'rainbow_reels',
+    });
+    const blob = new Blob([subText], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `svara-${item.voiceLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.wav`;
+    anchor.download = `svara-${item.clipId || item.id}.${format}`;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
@@ -62,7 +97,7 @@ export function HistoryPanel({
             No generated clips yet
           </h2>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Generate speech in English, Hindi, or multi-speaker dialogue to save playable WAV clips here.
+            Generate speech in English, Hindi, or multi-speaker dialogue to save playable WAV clips and captions here.
           </p>
         </div>
         <button
@@ -115,10 +150,15 @@ export function HistoryPanel({
             hour: '2-digit',
             minute: '2-digit',
           });
+          const rateLabel = item.sampleRate
+            ? `${(item.sampleRate / 1000).toFixed(item.sampleRate === 44100 ? 1 : 0)} kHz`
+            : '48 kHz';
+          const channelLabel = item.channels === 2 ? 'Stereo' : 'Mono';
+
           return (
             <div
               key={item.id}
-              className={`p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-colors ${
+              className={`p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 transition-colors ${
                 isActive
                   ? 'bg-blue-50/40 dark:bg-blue-950/30'
                   : 'hover:bg-slate-50/60 dark:hover:bg-slate-800/40'
@@ -148,12 +188,12 @@ export function HistoryPanel({
                       : item.language === 'bilingual'
                         ? 'Bilingual'
                         : 'English'}{' '}
-                    · {formatAudioTime(item.durationSec)} · {dateLabel}
+                    · {rateLabel} {channelLabel} WAV · {formatAudioTime(item.durationSec)} · {dateLabel}
                   </p>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
                 <button
                   type="button"
                   onClick={() => onRestoreToStudio(item)}
@@ -162,14 +202,39 @@ export function HistoryPanel({
                   <RotateCcw className="w-3.5 h-3.5" />
                   <span>Load in Studio</span>
                 </button>
+
+                {item.wordTimings && item.wordTimings.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadSubtitles(item, 'srt')}
+                      aria-label={`Download SRT subtitles for ${item.textPreview}`}
+                      className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
+                    >
+                      <Captions className="w-3.5 h-3.5" />
+                      <span>.SRT</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadSubtitles(item, 'ass')}
+                      aria-label={`Download Rainbow Reels ASS captions for ${item.textPreview}`}
+                      className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
+                    >
+                      <span>.ASS</span>
+                    </button>
+                  </>
+                )}
+
                 <button
                   type="button"
-                  onClick={() => handleDownloadItem(item)}
+                  onClick={() => handleDownloadWav(item)}
                   aria-label={`Download WAV for ${item.textPreview}`}
-                  className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                  className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-[#0F172A] dark:bg-[#2563EB] text-white text-xs font-medium hover:bg-slate-800 dark:hover:bg-blue-700 transition-colors whitespace-nowrap"
                 >
-                  <Download className="w-4 h-4" />
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download WAV</span>
                 </button>
+
                 <button
                   type="button"
                   onClick={() => onDeleteItem(item.id)}

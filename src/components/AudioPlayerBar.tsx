@@ -1,14 +1,30 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, Download, Link2, Pause, Play, Volume2, VolumeX } from 'lucide-react';
+import {
+  Captions,
+  Check,
+  Download,
+  Link2,
+  Pause,
+  Play,
+  Volume2,
+  VolumeX,
+} from 'lucide-react';
+import type { ChannelCount, SampleRateHz, SubtitleFormat, WordTiming } from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
+import { generateSubtitles } from '../utils/subtitleGenerator';
 
 export interface ActiveTrack {
   id: string;
+  clipId?: string;
   title: string;
   subtitle: string;
   audioBase64: string;
   audioUrl?: string;
+  downloadUrl?: string;
   durationSec: number;
+  sampleRate?: SampleRateHz;
+  channels?: ChannelCount;
+  wordTimings?: WordTiming[];
 }
 
 interface AudioPlayerBarProps {
@@ -173,16 +189,44 @@ export function AudioPlayerBar({
     setPlaybackRate(next);
   };
 
-  const handleDownload = () => {
-    if (!blobUrl || !track) return;
-    const anchor = document.createElement('a');
-    anchor.href = blobUrl;
+  const handleDownloadWav = () => {
+    if (!track) return;
     const safeName =
-      track.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 32) || 'svara-speech';
+      track.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32) ||
+      'svara-speech';
+    const anchor = document.createElement('a');
+    if (track.clipId) {
+      anchor.href = `/api/clips/${track.clipId}.wav?download=1`;
+    } else if (blobUrl) {
+      anchor.href = blobUrl;
+    } else {
+      return;
+    }
     anchor.download = `${safeName}.wav`;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
+  };
+
+  const handleDownloadSubtitles = (format: SubtitleFormat) => {
+    if (!track?.wordTimings?.length) return;
+    const safeName =
+      track.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32) ||
+      'svara-captions';
+    const subContent = generateSubtitles({
+      wordTimings: track.wordTimings,
+      format,
+      preset: 'rainbow_reels',
+    });
+    const blob = new Blob([subContent], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${safeName}.${format}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
   };
 
   const handleCopyShareLink = async () => {
@@ -196,6 +240,10 @@ export function AudioPlayerBar({
       // Ignore clipboard failure
     }
   };
+
+  const formatMeta = track
+    ? `${track.sampleRate ? `${(track.sampleRate / 1000).toFixed(track.sampleRate === 44100 ? 1 : 0)} kHz` : '48 kHz'} · ${track.channels === 2 ? 'Stereo' : 'Mono'} WAV`
+    : '48 kHz studio WAV';
 
   return (
     <div
@@ -236,15 +284,15 @@ export function AudioPlayerBar({
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400 truncate hidden sm:block">
               {isGenerating
-                ? 'Generating 24kHz studio WAV'
+                ? 'Generating mastered studio WAV'
                 : track
-                  ? track.subtitle
+                  ? `${track.subtitle} · ${formatMeta}`
                   : 'Write or load a script and press Generate Speech'}
             </p>
           </div>
         </div>
 
-        <div className="hidden sm:flex items-center gap-3 flex-1 min-w-[200px] max-w-xl">
+        <div className="hidden sm:flex items-center gap-3 flex-1 min-w-[180px] max-w-md">
           <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 w-9 text-right shrink-0">
             {formatAudioTime(currentTime)}
           </span>
@@ -283,7 +331,7 @@ export function AudioPlayerBar({
             {playbackRate}x
           </button>
 
-          <div className="hidden sm:flex items-center gap-1.5 px-2">
+          <div className="hidden xl:flex items-center gap-1.5 px-1">
             <button
               type="button"
               onClick={() => setIsMuted((prev) => !prev)}
@@ -311,17 +359,29 @@ export function AudioPlayerBar({
             />
           </div>
 
+          {track?.wordTimings && track.wordTimings.length > 0 && (
+            <button
+              type="button"
+              onClick={() => handleDownloadSubtitles('srt')}
+              aria-label="Download SRT subtitles"
+              className="hidden md:inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Captions className="w-3.5 h-3.5" />
+              <span>.SRT</span>
+            </button>
+          )}
+
           {track?.audioUrl && (
             <button
               type="button"
               onClick={handleCopyShareLink}
               aria-label="Copy audio clip URL"
-              className="hidden md:inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+              className="hidden lg:inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
             >
               {copiedLink ? (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>Copied Link</span>
+                  <span>Copied</span>
                 </>
               ) : (
                 <>
@@ -334,9 +394,10 @@ export function AudioPlayerBar({
 
           <button
             type="button"
-            onClick={handleDownload}
+            onClick={handleDownloadWav}
             disabled={!track}
-            className="inline-flex items-center gap-1.5 px-3.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:text-slate-400 dark:disabled:text-slate-600 disabled:bg-slate-50 dark:disabled:bg-slate-900 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
+            data-testid="player-download-wav"
+            className="inline-flex items-center gap-1.5 px-3.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-[#0F172A] dark:bg-[#2563EB] text-white text-xs font-medium hover:bg-slate-800 dark:hover:bg-blue-700 disabled:text-slate-400 dark:disabled:text-slate-600 disabled:bg-slate-100 dark:disabled:bg-slate-800 disabled:border-slate-200 dark:disabled:border-slate-700 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
           >
             <Download className="w-3.5 h-3.5" />
             <span>Download WAV</span>

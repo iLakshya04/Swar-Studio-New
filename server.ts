@@ -7,12 +7,27 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createSvaraMcpServer } from './src/mcp/createSvaraMcpServer';
 import {
-  getClip,
+  createProject,
+  deletePronunciation,
+  deleteVoicePreset,
+  getClipAudioBuffer,
+  getClipRecord,
+  getProject,
+  listProjects,
+  listPronunciations,
+  listRecentClips,
+  listVoicePresets,
+  upsertPronunciation,
+  upsertVoicePreset,
+} from './src/server/studioStore';
+import {
   mapApiError,
+  regenerateClipSegment,
   synthesizeSpeech,
   translateSpeechScript,
 } from './src/server/ttsService';
-import type { GenerateRequestPayload } from './src/types';
+import { generateSubtitles } from './src/utils/subtitleGenerator';
+import type { GenerateRequestPayload, SubtitleFormat, SubtitlePreset, WordTiming } from './src/types';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,7 +62,7 @@ function mcpCorsMiddleware(req: Request, res: Response, next: NextFunction): voi
 async function startServer() {
   const app = express();
   app.set('trust proxy', true);
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({ limit: '16mb' }));
 
   const sseSessions = new Map<string, SSEServerTransport>();
 
@@ -60,16 +75,91 @@ async function startServer() {
     });
   });
 
-  app.get('/api/clips/:id.wav', mcpCorsMiddleware, (req: Request, res: Response) => {
-    const clip = getClip(String(req.params.id));
-    if (!clip) {
+  // Serve WAV / MP3 / M4A / FLAC clips with inline or attachment disposition
+  app.get('/api/clips/:id.:ext', mcpCorsMiddleware, (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    const ext = String(req.params.ext || 'wav').toLowerCase();
+    const preferWav = ext === 'wav';
+    const found = getClipAudioBuffer(id, preferWav);
+    if (!found) {
       res.status(404).json({ error: 'Audio clip expired or not found.' });
       return;
     }
-    res.setHeader('Content-Type', clip.mimeType || 'audio/wav');
-    res.setHeader('Content-Disposition', `inline; filename="svara-${clip.id}.wav"`);
+    const isDownload = req.query.download === '1' || req.query.download === 'true';
+    res.setHeader('Content-Type', found.mimeType || 'audio/wav');
+    res.setHeader(
+      'Content-Disposition',
+      `${isDownload ? 'attachment' : 'inline'}; filename="svara-${id}.${found.ext}"`
+    );
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.send(clip.wavBuffer);
+    res.send(found.buffer);
+  });
+
+  app.get('/api/clips/:id/subtitles/:format', mcpCorsMiddleware, (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    const format = String(req.params.format || 'srt').toLowerCase() as SubtitleFormat;
+    if (!['srt', 'vtt', 'ass', 'json'].includes(format)) {
+      res.status(400).json({ error: 'Unsupported subtitle format.' });
+      return;
+    }
+    const record = getClipRecord(id);
+    if (!record) {
+      res.status(404).json({ error: 'Clip not found.' });
+      return;
+    }
+    const preset = (String(req.query.preset || 'rainbow_reels') as SubtitlePreset);
+    const maxLinesNum = Number(req.query.maxLines || 3);
+    const maxLines = (maxLinesNum === 1 || maxLinesNum === 2 ? maxLinesNum : 3) as 1 | 2 | 3;
+
+    const text = generateSubtitles({
+      wordTimings: record.wordTimings,
+      format,
+      preset,
+      maxLines,
+    });
+    const mimeMap: Record<SubtitleFormat, string> = {
+      srt: 'application/x-subrip; charset=utf-8',
+      vtt: 'text/vtt; charset=utf-8',
+      ass: 'text/x-ssa; charset=utf-8',
+      json: 'application/json; charset=utf-8',
+    };
+    const isDownload = req.query.download === '1' || req.query.download === 'true';
+    res.setHeader('Content-Type', mimeMap[format]);
+    res.setHeader(
+      'Content-Disposition',
+      `${isDownload ? 'attachment' : 'inline'}; filename="svara-${id}.${format}"`
+    );
+    res.send(text);
+  });
+
+  app.post('/api/subtitles', (req: Request, res: Response) => {
+    const body = req.body as {
+      clipId?: string;
+      wordTimings?: WordTiming[];
+      format?: SubtitleFormat;
+      preset?: SubtitlePreset;
+      maxLines?: 1 | 2 | 3;
+      maxCharsPerLine?: number;
+      maxPhraseDurationMs?: number;
+    };
+    const timings = body.clipId ? getClipRecord(body.clipId)?.wordTimings : body.wordTimings;
+    if (!timings || timings.length === 0) {
+      res.status(404).json({ error: 'No word timings found for subtitle generation.' });
+      return;
+    }
+    const content = generateSubtitles({
+      wordTimings: timings,
+      format: body.format || 'srt',
+      preset: body.preset || 'rainbow_reels',
+      maxLines: body.maxLines || 3,
+      maxCharsPerLine: body.maxCharsPerLine,
+      maxPhraseDurationMs: body.maxPhraseDurationMs,
+    });
+    res.json({ format: body.format || 'srt', content });
+  });
+
+  app.get('/api/clips', (_req: Request, res: Response) => {
+    res.json({ clips: listRecentClips(30) });
   });
 
   app.post('/api/tts/generate', async (req: Request, res: Response) => {
@@ -83,18 +173,126 @@ async function startServer() {
     }
   });
 
+  app.post('/api/tts/segments/regenerate', async (req: Request, res: Response) => {
+    try {
+      const body = req.body as {
+        clipId: string;
+        segmentIndex: number;
+        text?: string;
+        emotion?: string;
+        voiceId?: string;
+        stylePrompt?: string;
+        speed?: number;
+      };
+      const result = await regenerateClipSegment(body);
+      res.json(result);
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message });
+    }
+  });
+
   app.post('/api/script/translate', async (req: Request, res: Response) => {
     try {
-      const { text, targetLanguage } = req.body as {
+      const { text, targetLanguage, preserveDuration } = req.body as {
         text?: string;
         targetLanguage?: 'en' | 'hi' | 'bilingual';
+        preserveDuration?: boolean;
       };
-      const translatedText = await translateSpeechScript(text || '', targetLanguage || 'hi');
+      const translatedText = await translateSpeechScript(
+        text || '',
+        targetLanguage || 'hi',
+        Boolean(preserveDuration)
+      );
       res.json({ translatedText });
     } catch (error) {
       const mapped = mapApiError(error);
       res.status(mapped.status).json({ error: mapped.message });
     }
+  });
+
+  // Pronunciation dictionary endpoints
+  app.get('/api/pronunciations', (_req: Request, res: Response) => {
+    res.json({ entries: listPronunciations() });
+  });
+
+  app.post('/api/pronunciations', (req: Request, res: Response) => {
+    const body = req.body as {
+      id?: string;
+      term?: string;
+      phonetic?: string;
+      ipa?: string;
+      language?: 'en' | 'hi' | 'bilingual';
+      notes?: string;
+      enabled?: boolean;
+    };
+    if (!body.term?.trim() || !body.phonetic?.trim()) {
+      res.status(400).json({ error: 'Both term and phonetic spelling are required.' });
+      return;
+    }
+    const entry = upsertPronunciation({
+      id: body.id,
+      term: body.term,
+      phonetic: body.phonetic,
+      ipa: body.ipa,
+      language: body.language,
+      notes: body.notes,
+      enabled: body.enabled,
+    });
+    res.json({ entry, entries: listPronunciations() });
+  });
+
+  app.delete('/api/pronunciations/:id', (req: Request, res: Response) => {
+    const deleted = deletePronunciation(String(req.params.id));
+    res.json({ deleted, entries: listPronunciations() });
+  });
+
+  // Saved voice presets endpoints
+  app.get('/api/presets', (_req: Request, res: Response) => {
+    res.json({ presets: listVoicePresets() });
+  });
+
+  app.post('/api/presets', (req: Request, res: Response) => {
+    const body = req.body as Parameters<typeof upsertVoicePreset>[0];
+    if (!body.name?.trim() || !body.voiceId?.trim()) {
+      res.status(400).json({ error: 'Preset name and voiceId are required.' });
+      return;
+    }
+    const preset = upsertVoicePreset(body);
+    res.json({ preset, presets: listVoicePresets() });
+  });
+
+  app.delete('/api/presets/:id', (req: Request, res: Response) => {
+    const deleted = deleteVoicePreset(String(req.params.id));
+    res.json({ deleted, presets: listVoicePresets() });
+  });
+
+  // Projects endpoints
+  app.get('/api/projects', (_req: Request, res: Response) => {
+    res.json({ projects: listProjects() });
+  });
+
+  app.post('/api/projects', (req: Request, res: Response) => {
+    const body = req.body as { name?: string; description?: string; defaultVoicePresetId?: string };
+    if (!body.name?.trim()) {
+      res.status(400).json({ error: 'Project name is required.' });
+      return;
+    }
+    const project = createProject({
+      name: body.name,
+      description: body.description,
+      defaultVoicePresetId: body.defaultVoicePresetId,
+    });
+    res.json({ project });
+  });
+
+  app.get('/api/projects/:id', (req: Request, res: Response) => {
+    const proj = getProject(String(req.params.id));
+    if (!proj) {
+      res.status(404).json({ error: 'Project not found.' });
+      return;
+    }
+    res.json({ project: proj });
   });
 
   // Streamable HTTP MCP Endpoint for ChatGPT Connectors, Claude.ai, and Claude Code

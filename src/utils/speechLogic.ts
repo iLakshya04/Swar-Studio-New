@@ -2,6 +2,7 @@ import type {
   DialogueLine,
   EmotionIntensity,
   EngineTier,
+  ExpressiveControls,
   GenerateRequestPayload,
   LanguageMode,
   PitchRegister,
@@ -10,10 +11,14 @@ import type {
 
 const DEVANAGARI_REGEX = /[\u0900-\u097F]/g;
 const LATIN_WORD_REGEX = /[A-Za-z]{2,}/g;
-const VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\|)/i;
+const VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\||\[[A-Z_]{2,24}\])/i;
 
 export function detectScriptLanguage(text: string): LanguageMode {
-  const cleaned = text.replace(/<[^>]+>/g, '').replace(/\|[^|]+\|/g, '').trim();
+  const cleaned = text
+    .replace(/\[[A-Z_]{2,24}\]/g, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\|[^|]+\|/g, '')
+    .trim();
   if (!cleaned) {
     return 'en';
   }
@@ -35,7 +40,11 @@ export function countWordsAndChars(text: string): {
   estimatedSeconds: number;
 } {
   const chars = text.length;
-  const plainText = text.replace(/<[^>]+>/g, ' ').replace(/\|[^|]+\|/g, ' ').trim();
+  const plainText = text
+    .replace(/\[[A-Z_]{2,24}\]/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\|[^|]+\|/g, ' ')
+    .trim();
   if (!plainText) {
     return { chars, words: 0, estimatedSeconds: 0 };
   }
@@ -132,6 +141,39 @@ export function clampSpeed(speed: number): number {
   return Math.min(1.4, Math.max(0.7, Math.round(speed * 20) / 20));
 }
 
+export function describeExpressiveControls(controls?: ExpressiveControls): string[] {
+  if (!controls) return [];
+  const cues: string[] = [];
+  if (typeof controls.energy === 'number') {
+    if (controls.energy >= 75) cues.push('high vocal energy and forward drive');
+    else if (controls.energy <= 25) cues.push('calm, low-key restrained energy');
+  }
+  if (typeof controls.warmth === 'number') {
+    if (controls.warmth >= 75) cues.push('rich, inviting vocal warmth');
+    else if (controls.warmth <= 25) cues.push('cool, analytical objectivity');
+  }
+  if (typeof controls.authority === 'number' && controls.authority >= 70) {
+    cues.push('commanding, grounded authority');
+  }
+  if (typeof controls.curiosity === 'number' && controls.curiosity >= 70) {
+    cues.push('inquisitive, curious storytelling inflection');
+  }
+  if (typeof controls.dramaticTension === 'number' && controls.dramaticTension >= 70) {
+    cues.push('cinematic dramatic tension');
+  }
+  if (typeof controls.pauseStrength === 'number') {
+    if (controls.pauseStrength >= 75) cues.push('pronounced, thoughtful pauses at punctuation');
+    else if (controls.pauseStrength <= 25) cues.push('tight, minimal pauses between clauses');
+  }
+  if (typeof controls.smile === 'number' && controls.smile >= 70) {
+    cues.push('audible warm smile in the voice');
+  }
+  if (typeof controls.whisper === 'number' && controls.whisper >= 65) {
+    cues.push('hushed, breathy near-whisper intimacy');
+  }
+  return cues;
+}
+
 export function buildStyleInstruction(params: {
   language: LanguageMode;
   stylePrompt: string;
@@ -139,6 +181,9 @@ export function buildStyleInstruction(params: {
   speed: number;
   pitchRegister?: PitchRegister;
   emotionIntensity?: EmotionIntensity;
+  expressiveControls?: ExpressiveControls;
+  pronunciationPrompt?: string;
+  emotionHint?: string;
 }): string {
   const parts: string[] = [];
 
@@ -148,6 +193,10 @@ export function buildStyleInstruction(params: {
 
   if (params.stylePrompt.trim()) {
     parts.push(`Delivery style: ${params.stylePrompt.trim()}`);
+  }
+
+  if (params.emotionHint?.trim()) {
+    parts.push(`Scene emotion: ${params.emotionHint.trim()}`);
   }
 
   if (params.pitchRegister === 'deep') {
@@ -160,6 +209,11 @@ export function buildStyleInstruction(params: {
     parts.push('restrained, understated emotional tone');
   } else if (params.emotionIntensity === 'dramatic') {
     parts.push('highly expressive, theatrical emotional inflection');
+  }
+
+  const expressiveCues = describeExpressiveControls(params.expressiveControls);
+  if (expressiveCues.length > 0) {
+    parts.push(...expressiveCues);
   }
 
   if (params.language === 'hi') {
@@ -183,6 +237,10 @@ export function buildStyleInstruction(params: {
     parts.push('slightly upbeat pacing');
   }
 
+  if (params.pronunciationPrompt?.trim()) {
+    parts.push(params.pronunciationPrompt.trim());
+  }
+
   return parts.join('. ');
 }
 
@@ -199,16 +257,19 @@ export function validateGeneratePayload(
       };
     }
     const totalLength = nonEmptyLines.reduce((acc, line) => acc + line.text.length, 0);
-    if (totalLength > 4000) {
+    if (totalLength > 8000) {
       return {
         valid: false,
-        error: 'Dialogue script exceeds the 4,000-character limit.',
+        error: 'Dialogue script exceeds the 8,000-character limit.',
       };
     }
-    if (!payload.speakers?.A?.name?.trim() || !payload.speakers?.B?.name?.trim()) {
+    if (
+      (!payload.speakerList || payload.speakerList.length === 0) &&
+      (!payload.speakers?.A?.name?.trim() || !payload.speakers?.B?.name?.trim())
+    ) {
       return {
         valid: false,
-        error: 'Both Speaker A and Speaker B must have display names.',
+        error: 'All active speakers must have display names.',
       };
     }
     return { valid: true };
@@ -221,10 +282,10 @@ export function validateGeneratePayload(
       error: 'Enter a script in English or Hindi before generating speech.',
     };
   }
-  if (text.length > 4000) {
+  if (text.length > 8000) {
     return {
       valid: false,
-      error: 'Script exceeds the 4,000-character limit.',
+      error: 'Script exceeds the 8,000-character limit.',
     };
   }
 

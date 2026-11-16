@@ -3,11 +3,13 @@ import { AudioWaveform, Moon, Plus, Sun } from 'lucide-react';
 import { AudioPlayerBar, type ActiveTrack } from './components/AudioPlayerBar';
 import { HistoryPanel } from './components/HistoryPanel';
 import { McpConnectPanel } from './components/McpConnectPanel';
+import { PronunciationModal } from './components/PronunciationModal';
 import { SidebarNav, type ActiveTab } from './components/SidebarNav';
 import { SpeechStudio } from './components/SpeechStudio';
 import { VoiceLibrary } from './components/VoiceLibrary';
 import { DEFAULT_DIALOGUE_LINES, SAMPLE_TEMPLATES, VOICE_PRESETS } from './data/voices';
 import type {
+  ChannelCount,
   DialogueLine,
   EmotionIntensity,
   EngineTier,
@@ -15,7 +17,11 @@ import type {
   GenerateResponsePayload,
   HistoryItem,
   LanguageMode,
+  MasteringPreset,
   PitchRegister,
+  PronunciationEntry,
+  SampleRateHz,
+  SavedVoicePresetConfig,
   SpeakerConfig,
   StudioMode,
   VoicePreset,
@@ -23,8 +29,9 @@ import type {
 import { validateGeneratePayload } from './utils/speechLogic';
 
 const HISTORY_STORAGE_KEY = 'svara_studio_history_v1';
+const PRONUNCIATION_STORAGE_KEY = 'svara_pronunciations_v1';
 const THEME_STORAGE_KEY = 'svara_theme_v1';
-const MAX_STORED_CLIPS = 8;
+const MAX_STORED_CLIPS = 10;
 
 function loadHistory(): HistoryItem[] {
   try {
@@ -46,6 +53,17 @@ function saveHistory(items: HistoryItem[]): void {
     } catch {
       // Ignore storage quota overflow gracefully
     }
+  }
+}
+
+function loadCachedPronunciations(): PronunciationEntry[] {
+  try {
+    const raw = localStorage.getItem(PRONUNCIATION_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
@@ -74,6 +92,11 @@ export default function App() {
   const [pitchRegister, setPitchRegister] = useState<PitchRegister>('balanced');
   const [emotionIntensity, setEmotionIntensity] = useState<EmotionIntensity>('natural');
   const [engineTier, setEngineTier] = useState<EngineTier>('expressive');
+  const [sampleRate, setSampleRate] = useState<SampleRateHz>(48000);
+  const [channels, setChannels] = useState<ChannelCount>(1);
+  const [masteringPreset, setMasteringPreset] = useState<MasteringPreset>('none');
+  const [normalizeAudio, setNormalizeAudio] = useState<boolean>(true);
+  const [targetDurationSec, setTargetDurationSec] = useState<string>('');
   const [text, setText] = useState<string>(defaultTemplate.text);
 
   const [speakers, setSpeakers] = useState<{ A: SpeakerConfig; B: SpeakerConfig }>({
@@ -92,13 +115,21 @@ export default function App() {
   });
   const [dialogueLines, setDialogueLines] = useState<DialogueLine[]>(DEFAULT_DIALOGUE_LINES);
 
+  const [pronunciations, setPronunciations] = useState<PronunciationEntry[]>(() =>
+    loadCachedPronunciations()
+  );
+  const [isPronunciationModalOpen, setIsPronunciationModalOpen] = useState<boolean>(false);
+  const [savedPresets, setSavedPresets] = useState<SavedVoicePresetConfig[]>([]);
+
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [regeneratingSegIdx, setRegeneratingSegIdx] = useState<number | null>(null);
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [serverAppUrl, setServerAppUrl] = useState<string | null>(null);
 
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [activeTrack, setActiveTrack] = useState<ActiveTrack | null>(null);
+  const [latestResult, setLatestResult] = useState<GenerateResponsePayload | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
@@ -114,11 +145,46 @@ export default function App() {
   }, [history]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(PRONUNCIATION_STORAGE_KEY, JSON.stringify(pronunciations));
+    } catch {
+      // Ignore storage error
+    }
+  }, [pronunciations]);
+
+  useEffect(() => {
     fetch('/api/health')
       .then((res) => res.json())
       .then((data: { mcpEndpoint?: string }) => {
         if (data?.mcpEndpoint) {
           setServerAppUrl(data.mcpEndpoint.replace(/\/mcp$/, ''));
+        }
+      })
+      .catch(() => {});
+
+    fetch('/api/pronunciations')
+      .then((res) => res.json())
+      .then((data: { entries?: PronunciationEntry[] }) => {
+        if (Array.isArray(data.entries)) {
+          setPronunciations((prev) => {
+            if (prev.length === 0) return data.entries!;
+            const merged = [...data.entries!];
+            for (const localItem of prev) {
+              if (!merged.some((m) => m.term.toLowerCase() === localItem.term.toLowerCase())) {
+                merged.push(localItem);
+              }
+            }
+            return merged;
+          });
+        }
+      })
+      .catch(() => {});
+
+    fetch('/api/presets')
+      .then((res) => res.json())
+      .then((data: { presets?: SavedVoicePresetConfig[] }) => {
+        if (Array.isArray(data.presets)) {
+          setSavedPresets(data.presets);
         }
       })
       .catch(() => {});
@@ -150,16 +216,171 @@ export default function App() {
   const handleResetScript = () => {
     setMode('single');
     setText('');
+    setLatestResult(null);
     setErrorMessage(null);
     setActiveTab('studio');
   };
 
+  const handleSavePronunciation = async (input: {
+    id?: string;
+    term: string;
+    phonetic: string;
+    ipa?: string;
+    language: LanguageMode;
+    notes?: string;
+    enabled: boolean;
+  }) => {
+    try {
+      const res = await fetch('/api/pronunciations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      });
+      const data = (await res.json()) as { entries?: PronunciationEntry[]; error?: string };
+      if (!res.ok) throw new Error(data.error || 'Could not save rule.');
+      if (Array.isArray(data.entries)) {
+        setPronunciations(data.entries);
+        return;
+      }
+    } catch {
+      // Fallback to local state update
+    }
+    setPronunciations((prev) => [
+      {
+        id: input.id || `pron-${Date.now()}`,
+        term: input.term,
+        phonetic: input.phonetic,
+        ipa: input.ipa,
+        language: input.language,
+        notes: input.notes,
+        enabled: input.enabled,
+        createdAt: new Date().toISOString(),
+      },
+      ...prev.filter((p) => p.term.toLowerCase() !== input.term.toLowerCase()),
+    ]);
+  };
+
+  const handleTogglePronunciation = async (entry: PronunciationEntry) => {
+    await handleSavePronunciation({
+      ...entry,
+      enabled: !entry.enabled,
+    });
+  };
+
+  const handleDeletePronunciation = async (id: string) => {
+    setPronunciations((prev) => prev.filter((p) => p.id !== id));
+    fetch(`/api/pronunciations/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  };
+
+  const handleApplySavedPreset = (presetId: string) => {
+    const preset = savedPresets.find((p) => p.id === presetId);
+    if (!preset) return;
+    setSelectedVoiceId(preset.voiceId);
+    setLanguage(preset.language);
+    setStylePrompt(preset.stylePrompt);
+    setSpeed(preset.speed);
+    setPitchRegister(preset.pitchRegister);
+    setEmotionIntensity(preset.emotionIntensity);
+    if (preset.customVoiceDescription) {
+      setVoiceDesignMode('custom');
+      setCustomVoiceDescription(preset.customVoiceDescription);
+    } else {
+      setVoiceDesignMode('prebuilt');
+    }
+    if (preset.masteringPreset) setMasteringPreset(preset.masteringPreset);
+    if (preset.sampleRate) setSampleRate(preset.sampleRate);
+    if (preset.channels) setChannels(preset.channels);
+  };
+
+  const handleSaveCurrentPreset = async (name: string) => {
+    const payload = {
+      name,
+      voiceId: selectedVoice.id,
+      language,
+      stylePrompt,
+      customVoiceDescription: voiceDesignMode === 'custom' ? customVoiceDescription : undefined,
+      speed,
+      pitchRegister,
+      emotionIntensity,
+      masteringPreset,
+      sampleRate,
+      channels,
+    };
+    const res = await fetch('/api/presets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as { presets?: SavedVoicePresetConfig[] };
+    if (Array.isArray(data.presets)) {
+      setSavedPresets(data.presets);
+    }
+  };
+
+  const pushGeneratedClip = (
+    data: GenerateResponsePayload,
+    fullScript: string,
+    voiceLabel: string
+  ) => {
+    const previewSnippet =
+      fullScript.length > 72 ? `${fullScript.slice(0, 72)}...` : fullScript;
+
+    const newItem: HistoryItem = {
+      id: `clip-${Date.now()}`,
+      clipId: data.clipId,
+      audioUrl: data.audioUrl,
+      downloadUrl: data.downloadUrl,
+      createdAt: new Date().toISOString(),
+      mode,
+      language,
+      voiceLabel,
+      voiceId: selectedVoice.id,
+      textPreview: previewSnippet,
+      fullText: fullScript,
+      stylePrompt,
+      customVoiceDescription:
+        voiceDesignMode === 'custom' ? customVoiceDescription : undefined,
+      speed,
+      pitchRegister,
+      emotionIntensity,
+      sampleRate: data.sampleRate || sampleRate,
+      channels: data.channels || channels,
+      masteringPreset,
+      modelUsed: data.modelUsed,
+      durationSec: data.durationEstimateSec,
+      durationMs: data.durationMs,
+      audioBase64: data.audioBase64,
+      wordTimings: data.wordTimings,
+      segments: data.segments,
+      dialogueLines: mode === 'multi' ? dialogueLines : undefined,
+      speakers: mode === 'multi' ? speakers : undefined,
+    };
+
+    setLatestResult(data);
+    setHistory((prev) => [newItem, ...prev].slice(0, MAX_STORED_CLIPS));
+    setActiveTrack({
+      id: newItem.id,
+      clipId: data.clipId,
+      title: previewSnippet,
+      subtitle: `${voiceLabel} · ${data.modelUsed}`,
+      audioBase64: data.audioBase64,
+      audioUrl: data.audioUrl,
+      downloadUrl: data.downloadUrl,
+      durationSec: data.durationEstimateSec,
+      sampleRate: data.sampleRate || sampleRate,
+      channels: data.channels || channels,
+      wordTimings: data.wordTimings,
+    });
+  };
+
   const handleGenerate = async () => {
+    const parsedTargetDur = Number(targetDurationSec);
     const payload: GenerateRequestPayload = {
       mode,
       language,
       modelTier: engineTier,
       text,
+      voiceId: selectedVoice.id,
       voiceName: selectedVoice.baseVoice,
       stylePrompt,
       customVoiceDescription:
@@ -167,6 +388,16 @@ export default function App() {
       speed,
       pitchRegister,
       emotionIntensity,
+      format: 'wav',
+      sampleRate,
+      channels,
+      normalize: normalizeAudio,
+      trimSilence: normalizeAudio,
+      masteringPreset,
+      targetDurationSeconds:
+        Number.isFinite(parsedTargetDur) && parsedTargetDur > 0.4 ? parsedTargetDur : undefined,
+      fitMode: Number.isFinite(parsedTargetDur) && parsedTargetDur > 0.4 ? 'stretch' : 'natural',
+      pronunciationRules: pronunciations,
       speakers: mode === 'multi' ? speakers : undefined,
       dialogueLines: mode === 'multi' ? dialogueLines : undefined,
     };
@@ -200,9 +431,6 @@ export default function App() {
               .join(' ')
           : text.trim();
 
-      const previewSnippet =
-        fullScript.length > 72 ? `${fullScript.slice(0, 72)}...` : fullScript;
-
       const voiceLabel =
         mode === 'multi'
           ? `${speakers.A.name} & ${speakers.B.name}`
@@ -210,45 +438,49 @@ export default function App() {
             ? 'Custom Voice Design'
             : `${selectedVoice.name} (${selectedVoice.roleTitle})`;
 
-      const newItem: HistoryItem = {
-        id: `clip-${Date.now()}`,
-        clipId: data.clipId,
-        audioUrl: data.audioUrl,
-        createdAt: new Date().toISOString(),
-        mode,
-        language,
-        voiceLabel,
-        voiceId: selectedVoice.id,
-        textPreview: previewSnippet,
-        fullText: fullScript,
-        stylePrompt,
-        customVoiceDescription:
-          voiceDesignMode === 'custom' ? customVoiceDescription : undefined,
-        speed,
-        pitchRegister,
-        emotionIntensity,
-        modelUsed: data.modelUsed,
-        durationSec: data.durationEstimateSec,
-        audioBase64: data.audioBase64,
-        dialogueLines: mode === 'multi' ? dialogueLines : undefined,
-        speakers: mode === 'multi' ? speakers : undefined,
-      };
-
-      setHistory((prev) => [newItem, ...prev].slice(0, MAX_STORED_CLIPS));
-      setActiveTrack({
-        id: newItem.id,
-        title: previewSnippet,
-        subtitle: `${voiceLabel} · ${data.modelUsed}`,
-        audioBase64: data.audioBase64,
-        audioUrl: data.audioUrl,
-        durationSec: data.durationEstimateSec,
-      });
+      pushGeneratedClip(data, fullScript, voiceLabel);
     } catch (err) {
       setErrorMessage(
         err instanceof Error ? err.message : 'Unable to generate speech right now.'
       );
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const handleRegenerateSegment = async (segmentIndex: number, nextText: string) => {
+    if (!latestResult?.clipId) return;
+    setRegeneratingSegIdx(segmentIndex);
+    setErrorMessage(null);
+    try {
+      const response = await fetch('/api/tts/segments/regenerate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          clipId: latestResult.clipId,
+          segmentIndex,
+          text: nextText,
+          voiceId: selectedVoice.id,
+          stylePrompt,
+          speed,
+        }),
+      });
+      const data = (await response.json()) as GenerateResponsePayload & { error?: string };
+      if (!response.ok || !data.audioBase64) {
+        throw new Error(data.error || 'Segment regeneration failed.');
+      }
+      const updatedText = data.segments?.map((s) => s.text).join(' ') || text;
+      pushGeneratedClip(
+        data,
+        updatedText,
+        `${selectedVoice.name} (${selectedVoice.roleTitle})`
+      );
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Unable to regenerate segment.'
+      );
+    } finally {
+      setRegeneratingSegIdx(null);
     }
   };
 
@@ -261,9 +493,13 @@ export default function App() {
         language: voice.sampleLanguage,
         modelTier: 'expressive',
         text: voice.sampleText,
+        voiceId: voice.id,
         voiceName: voice.baseVoice,
         stylePrompt: voice.defaultStyle,
         speed: 1.0,
+        sampleRate: 48000,
+        channels: 1,
+        pronunciationRules: pronunciations,
       };
       const response = await fetch('/api/tts/generate', {
         method: 'POST',
@@ -277,11 +513,16 @@ export default function App() {
 
       setActiveTrack({
         id: `preview-${voice.id}-${Date.now()}`,
+        clipId: data.clipId,
         title: `${voice.name} — ${voice.roleTitle}`,
         subtitle: `${voice.language} Sample · ${voice.accent}`,
         audioBase64: data.audioBase64,
         audioUrl: data.audioUrl,
+        downloadUrl: data.downloadUrl,
         durationSec: data.durationEstimateSec,
+        sampleRate: data.sampleRate || 48000,
+        channels: data.channels || 1,
+        wordTimings: data.wordTimings,
       });
     } catch (err) {
       setErrorMessage(
@@ -295,11 +536,16 @@ export default function App() {
   const handlePlayHistoryItem = (item: HistoryItem) => {
     setActiveTrack({
       id: item.id,
+      clipId: item.clipId,
       title: item.textPreview,
       subtitle: `${item.voiceLabel} · ${item.modelUsed}`,
       audioBase64: item.audioBase64,
       audioUrl: item.audioUrl,
+      downloadUrl: item.downloadUrl,
       durationSec: item.durationSec,
+      sampleRate: item.sampleRate,
+      channels: item.channels,
+      wordTimings: item.wordTimings,
     });
   };
 
@@ -311,6 +557,9 @@ export default function App() {
     setSpeed(item.speed);
     if (item.pitchRegister) setPitchRegister(item.pitchRegister);
     if (item.emotionIntensity) setEmotionIntensity(item.emotionIntensity);
+    if (item.sampleRate) setSampleRate(item.sampleRate);
+    if (item.channels) setChannels(item.channels);
+    if (item.masteringPreset) setMasteringPreset(item.masteringPreset);
     if (item.customVoiceDescription) {
       setVoiceDesignMode('custom');
       setCustomVoiceDescription(item.customVoiceDescription);
@@ -325,6 +574,8 @@ export default function App() {
     }
     setActiveTab('studio');
   };
+
+  const activePronunciationCount = pronunciations.filter((p) => p.enabled).length;
 
   const breadcrumbLabel =
     activeTab === 'studio'
@@ -457,11 +708,11 @@ export default function App() {
                   </h1>
                   <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
                     {activeTab === 'studio'
-                      ? 'Synthesize expressive speech in English, हिन्दी (Hindi), and bilingual Hinglish with vocal tags, tone controls, and speed slider.'
+                      ? 'Synthesize expressive speech in English, हिन्दी (Hindi), and Hinglish with custom pronunciations, 48 kHz WAV mastering, and word-level captions.'
                       : activeTab === 'voices'
                         ? 'Explore curated English, Hindi, and bilingual voices—preview samples live or open directly in the studio.'
                         : activeTab === 'history'
-                          ? 'Replay, restore, or download your recently synthesized WAV clips.'
+                          ? 'Replay, restore, or download your synthesized .WAV audio files and .SRT / .ASS captions.'
                           : 'Connect ChatGPT and Claude directly to Svara Studio over Model Context Protocol (/mcp).'}
                   </p>
                 </div>
@@ -490,12 +741,30 @@ export default function App() {
                   onEmotionIntensityChange={setEmotionIntensity}
                   engineTier={engineTier}
                   onEngineTierChange={setEngineTier}
+                  sampleRate={sampleRate}
+                  onSampleRateChange={setSampleRate}
+                  channels={channels}
+                  onChannelsChange={setChannels}
+                  masteringPreset={masteringPreset}
+                  onMasteringPresetChange={setMasteringPreset}
+                  normalizeAudio={normalizeAudio}
+                  onNormalizeAudioChange={setNormalizeAudio}
+                  targetDurationSec={targetDurationSec}
+                  onTargetDurationSecChange={setTargetDurationSec}
+                  savedPresets={savedPresets}
+                  onApplySavedPreset={handleApplySavedPreset}
+                  onSaveCurrentPreset={handleSaveCurrentPreset}
+                  activePronunciationCount={activePronunciationCount}
+                  onOpenPronunciationModal={() => setIsPronunciationModalOpen(true)}
                   text={text}
                   onTextChange={setText}
                   speakers={speakers}
                   onSpeakersChange={setSpeakers}
                   dialogueLines={dialogueLines}
                   onDialogueLinesChange={setDialogueLines}
+                  latestResult={latestResult}
+                  regeneratingSegIdx={regeneratingSegIdx}
+                  onRegenerateSegment={handleRegenerateSegment}
                   isGenerating={isGenerating}
                   errorMessage={errorMessage}
                   onDismissError={() => setErrorMessage(null)}
@@ -555,6 +824,15 @@ export default function App() {
           />
         </div>
       </div>
+
+      <PronunciationModal
+        isOpen={isPronunciationModalOpen}
+        entries={pronunciations}
+        onClose={() => setIsPronunciationModalOpen(false)}
+        onSaveEntry={handleSavePronunciation}
+        onToggleEntry={handleTogglePronunciation}
+        onDeleteEntry={handleDeletePronunciation}
+      />
     </div>
   );
 }

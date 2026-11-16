@@ -151,6 +151,96 @@ export const VOICE_PRESETS: VoicePreset[] = [
     sampleLanguage: 'hi',
     portraitUrl: '/src/assets/images/voice_hindi_podcaster_1794826141541.jpg',
   },
+  {
+    id: 'ethan',
+    name: 'Ethan',
+    roleTitle: 'Deep Cinematic Narrator',
+    baseVoice: 'Charon',
+    language: 'English',
+    category: 'Narration',
+    gender: 'Male',
+    accent: 'American Neutral',
+    description: 'Deep, cinematic baritone crafted for science reels, nature documentaries, and high-retention YouTube essays.',
+    defaultStyle: 'Deep cinematic science documentary narrator, authoritative yet filled with quiet wonder',
+    sampleText: 'Fifty miles above the storm clouds, <breath> giant blue jets of lightning shoot upward into space.',
+    sampleLanguage: 'en',
+    portraitUrl: '/src/assets/images/voice_noir_narrator_1794826140228.jpg',
+  },
+  {
+    id: 'noah',
+    name: 'Noah',
+    roleTitle: 'Energetic Reel Creator',
+    baseVoice: 'Puck',
+    language: 'English',
+    category: 'Conversational',
+    gender: 'Male',
+    accent: 'American Youth',
+    description: 'Punchy, fast-paced young creator voice engineered for short-form Reels, TikTok hooks, and tech explainers.',
+    defaultStyle: 'Punchy, curious, fast-paced short-form video creator',
+    sampleText: 'Wait—stop scrolling for ten seconds. <breath> Why does water actually dance on a pan that is too hot?',
+    sampleLanguage: 'en',
+    portraitUrl: '/src/assets/images/voice_hindi_podcaster_1794826141541.jpg',
+  },
+  {
+    id: 'arthur',
+    name: 'Arthur',
+    roleTitle: 'British Documentary',
+    baseVoice: 'Fenrir',
+    language: 'English',
+    category: 'Narration',
+    gender: 'Male',
+    accent: 'British Documentary',
+    description: 'Mature, composed British documentary narrator suited for oceanography, history, and prestige features.',
+    defaultStyle: 'Measured, mature British documentary narrator with crisp diction and calm authority',
+    sampleText: 'Beneath the icy waters of the Denmark Strait lies the largest waterfall on Earth, hidden entirely from view.',
+    sampleLanguage: 'en',
+    portraitUrl: '/src/assets/images/voice_broadcast_anchor_1794826142499.jpg',
+  },
+  {
+    id: 'elena',
+    name: 'Elena',
+    roleTitle: 'Warm Documentary Host',
+    baseVoice: 'Kore',
+    language: 'English',
+    category: 'Narration',
+    gender: 'Female',
+    accent: 'Neutral International',
+    description: 'Warm, articulate documentary narrator ideal for human-interest profiles, long-form essays, and museum guides.',
+    defaultStyle: 'Warm, grounded documentary host with clear pacing and quiet empathy',
+    sampleText: 'Every drop of rain that hits the desert floor carries the memory of an ocean thousands of miles away.',
+    sampleLanguage: 'en',
+    portraitUrl: '/src/assets/images/voice_broadcast_anchor_1794826142499.jpg',
+  },
+  {
+    id: 'maya',
+    name: 'Maya',
+    roleTitle: 'Curious Science Explainer',
+    baseVoice: 'Zephyr',
+    language: 'English',
+    category: 'Narration',
+    gender: 'Female',
+    accent: 'American Neutral',
+    description: 'Bright, inquisitive science educator voice built for physics explainers, curiosity hooks, and STEM lessons.',
+    defaultStyle: 'Curious, bright science explainer with natural inflection and wonder',
+    sampleText: 'This lightning does not strike the ground—it shoots upward, straight toward the ionosphere.',
+    sampleLanguage: 'en',
+    portraitUrl: '/src/assets/images/voice_wellness_guide_1794826141052.jpg',
+  },
+  {
+    id: 'rohan',
+    name: 'Rohan',
+    roleTitle: 'Hindi Cinematic Voice',
+    baseVoice: 'Fenrir',
+    language: 'Hindi',
+    category: 'Characters',
+    gender: 'Male',
+    accent: 'Cinematic Hindi',
+    description: 'Resonant, intense Hindi voiceover artist built for epic trailers, mythological stories, and high-drama reels.',
+    defaultStyle: 'Resonant, cinematic Hindi voiceover with dramatic gravitas and crisp articulation',
+    sampleText: 'जब आसमान के ऊपर भी एक तूफ़ान जागता है, <breath> तब विज्ञान की हर सीमा टूट जाती है।',
+    sampleLanguage: 'hi',
+    portraitUrl: '/src/assets/images/voice_noir_narrator_1794826140228.jpg',
+  },
 ];
 
 export const VOCAL_TAGS = [
@@ -161,6 +251,13 @@ export const VOCAL_TAGS = [
   { tag: '<gasp>', label: 'Gasp', hint: 'Sudden surprise' },
 ];
 
+export const EMOTION_CUES = [
+  { tag: '[CURIOUS]', label: 'Curious', hint: 'Inquisitive upward inflection' },
+  { tag: '[AWE]', label: 'Awe', hint: 'Quiet sense of wonder' },
+  { tag: '[CHALLENGING]', label: 'Challenging', hint: 'Sharp counter-intuitive emphasis' },
+  { tag: '[QUIET]', label: 'Quiet', hint: 'Intimate, lowered volume & pace' },
+];
+
 export const BACKCHANNEL_TAGS = [
   { tag: '|yeah|', label: '|yeah|', hint: 'Overlapping agreement' },
   { tag: '|mhm|', label: '|mhm|', hint: 'Subtle listener cue' },
@@ -168,6 +265,7 @@ export const BACKCHANNEL_TAGS = [
 
 export const TONE_PRESETS = [
   'Warm, expressive storyteller',
+  'Deep cinematic science narrator',
   'Clear, authoritative news anchor',
   'Airy, calm & soothing',
   'Upbeat, conversational host',
@@ -184,6 +282,14 @@ export interface SampleTemplate {
 }
 
 export const SAMPLE_TEMPLATES: SampleTemplate[] = [
+  {
+    id: 'science-reel',
+    label: 'Science Reel',
+    language: 'en',
+    voiceId: 'ethan',
+    stylePrompt: 'Deep cinematic science documentary narrator, authoritative yet filled with wonder',
+    text: '[CURIOUS] This lightning shoots upward, straight toward the ionosphere. <breath> [AWE] Above the storm clouds, giant blue jets bridge our sky and outer space.',
+  },
   {
     id: 'hindi-story',
     label: 'Hindi Kahani',
@@ -207,14 +313,6 @@ export const SAMPLE_TEMPLATES: SampleTemplate[] = [
     voiceId: 'vikram',
     stylePrompt: 'Upbeat, conversational bilingual podcast host',
     text: 'Hello creators! अगर आप अपने videos के लिए studio-quality Hindi और English voiceovers चाहते हैं, <chuckle> तो यह workflow आपका पूरा दिन बचा देगा।',
-  },
-  {
-    id: 'hindi-news',
-    label: 'Hindi Samachar',
-    language: 'hi',
-    voiceId: 'meera',
-    stylePrompt: 'Clear, authoritative Hindi broadcast news anchor',
-    text: 'सुप्रभात। आज के मुख्य समाचारों में बात करेंगे स्वच्छ ऊर्जा की नई परियोजनाओं और देश के प्रमुख शहरों में शुरू हो रही हाई-स्पीड रेल सेवा की।',
   },
 ];
 

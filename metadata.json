@@ -2,5 +2,7 @@
   "name": "Svara Studio",
   "description": "Bilingual English and Hindi AI voice generator and speech synthesis studio with custom voice design, multi-speaker dialogue, and expressive vocal tags.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
