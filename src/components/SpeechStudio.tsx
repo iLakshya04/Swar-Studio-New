@@ -616,6 +616,8 @@ export function SpeechStudio({
                   ? activeTrack.waveformPeaks
                   : latestResult?.waveformPeaks
               }
+              timingSource={activeTrack?.timingSource ?? latestResult?.timingSource}
+              timingConfidence={activeTrack?.timingConfidence ?? latestResult?.timingConfidence}
               durationSec={
                 playbackDuration > 0
                   ? playbackDuration

@@ -17,6 +17,7 @@ export type MasteringPreset =
 export type FitMode = 'natural' | 'tight' | 'stretch';
 export type SubtitleFormat = 'srt' | 'vtt' | 'ass' | 'json';
 export type SubtitlePreset = 'rainbow_reels' | 'clean_editorial';
+export type TimingSource = 'provider' | 'forced_alignment' | 'estimated';
 
 export type VoiceCategory =
   | 'Narration'
@@ -154,6 +155,8 @@ export interface GenerateRequestPayload extends AudioExportConfig {
   dialogueLines?: DialogueLine[];
   segmentMode?: boolean;
   projectId?: string;
+  returnWordTimings?: boolean;
+  returnWaveformPeaks?: boolean;
 }
 
 export interface GenerateResponsePayload {
@@ -169,8 +172,11 @@ export interface GenerateResponsePayload {
   modelUsed: string;
   voiceId?: string;
   voiceName?: string;
+  voiceUsed?: string;
   durationEstimateSec: number;
   durationMs?: number;
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   wordTimings?: WordTiming[];
   phraseTimings?: PhraseTiming[];
   speechEnvelope?: SpeechEnvelopeInterval[];
@@ -247,6 +253,8 @@ export interface HistoryItem {
   durationSec: number;
   durationMs?: number;
   audioBase64: string;
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   wordTimings?: WordTiming[];
   waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];

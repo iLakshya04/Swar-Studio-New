@@ -1,12 +1,14 @@
 import { useMemo, useRef, useState } from 'react';
 import { Pause, Play } from 'lucide-react';
-import type { WordTiming } from '../types';
+import type { TimingSource, WordTiming } from '../types';
 import { buildFallbackWaveformPeaks } from '../utils/generateClient';
 
 interface InteractiveWaveformProps {
   title?: string;
   wordTimings?: WordTiming[];
   waveformPeaks?: number[];
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   durationSec: number;
   currentTime: number;
   isPlaying: boolean;
@@ -24,6 +26,8 @@ export function InteractiveWaveform({
   title,
   wordTimings = [],
   waveformPeaks,
+  timingSource,
+  timingConfidence,
   durationSec,
   currentTime,
   isPlaying,
@@ -124,10 +128,19 @@ export function InteractiveWaveform({
 
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-[#0F172A] dark:text-slate-100 truncate">
-              Interactive Waveform &amp; Word Timings
+              {title ? `Interactive Waveform · ${title}` : 'Interactive Waveform & Word Timings'}
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 truncate tabular-nums">
-              {wordTimings.length} aligned words · Click waveform or any word to jump
+              {wordTimings.length} words ·{' '}
+              {timingSource === 'provider'
+                ? 'Provider timestamps'
+                : timingSource === 'estimated'
+                  ? 'Estimated pacing'
+                  : 'Forced-aligned'}
+              {typeof timingConfidence === 'number'
+                ? ` (${Math.round(timingConfidence * 100)}%)`
+                : ''}{' '}
+              · Click waveform or word to jump
             </p>
           </div>
         </div>

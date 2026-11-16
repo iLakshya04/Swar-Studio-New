@@ -364,6 +364,8 @@ export default function App() {
       durationSec: data.durationEstimateSec,
       durationMs: data.durationMs,
       audioBase64: data.audioBase64,
+      timingSource: data.timingSource,
+      timingConfidence: data.timingConfidence,
       wordTimings: data.wordTimings,
       waveformPeaks: data.waveformPeaks,
       segments: data.segments,
@@ -384,6 +386,8 @@ export default function App() {
       durationSec: data.durationEstimateSec,
       sampleRate: data.sampleRate || sampleRate,
       channels: data.channels || channels,
+      timingSource: data.timingSource,
+      timingConfidence: data.timingConfidence,
       wordTimings: data.wordTimings,
       waveformPeaks: data.waveformPeaks,
     });
@@ -504,19 +508,21 @@ export default function App() {
         audioBase64: data.audioBase64,
         audioUrl: data.audioUrl,
         downloadUrl: data.downloadUrl,
-        durationSec: data.durationEstimateSec,
-        sampleRate: data.sampleRate || 48000,
-        channels: data.channels || 1,
-        wordTimings: data.wordTimings,
-        waveformPeaks: data.waveformPeaks,
-      });
-    } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Unable to preview voice sample.'
-      );
-    } finally {
-      setPreviewingVoiceId(null);
-    }
+      durationSec: data.durationEstimateSec,
+      sampleRate: data.sampleRate || 48000,
+      channels: data.channels || 1,
+      timingSource: data.timingSource,
+      timingConfidence: data.timingConfidence,
+      wordTimings: data.wordTimings,
+      waveformPeaks: data.waveformPeaks,
+    });
+  } catch (err) {
+    setErrorMessage(
+      err instanceof Error ? err.message : 'Unable to preview voice sample.'
+    );
+  } finally {
+    setPreviewingVoiceId(null);
+  }
   };
 
   const handlePlayHistoryItem = (item: HistoryItem) => {
@@ -531,6 +537,8 @@ export default function App() {
       durationSec: item.durationSec,
       sampleRate: item.sampleRate,
       channels: item.channels,
+      timingSource: item.timingSource,
+      timingConfidence: item.timingConfidence,
       wordTimings: item.wordTimings,
       waveformPeaks: item.waveformPeaks,
     });
@@ -796,6 +804,7 @@ export default function App() {
                 <HistoryPanel
                   items={history}
                   activeTrackId={activeTrack?.id ?? null}
+                  playback={playback}
                   onPlayItem={handlePlayHistoryItem}
                   onRestoreToStudio={handleRestoreToStudio}
                   onDeleteItem={(id) =>

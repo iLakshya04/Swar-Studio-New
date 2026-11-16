@@ -259,10 +259,25 @@ var VOICE_PRESETS = [
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-var STORE_DIR = "/tmp/svara-studio";
+function resolveStoreDir() {
+  if (process.env.SVARA_DATA_DIR?.trim()) {
+    return path.resolve(process.env.SVARA_DATA_DIR.trim());
+  }
+  const preferred = path.resolve(process.cwd(), ".svara-data");
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    return preferred;
+  } catch {
+    return "/tmp/svara-studio";
+  }
+}
+var STORE_DIR = resolveStoreDir();
 var CLIPS_DIR = path.join(STORE_DIR, "clips");
 var STATE_FILE = path.join(STORE_DIR, "state.json");
-var MAX_CLIPS = 120;
+var MAX_CLIPS = 500;
+function getStoreDir() {
+  return STORE_DIR;
+}
 var DEFAULT_PRONUNCIATIONS = [
   {
     id: "pron-leidenfrost",
@@ -493,10 +508,15 @@ function saveStoredClip(params) {
     modelUsed: params.modelUsed,
     language: params.language,
     displayText: params.displayText,
+    stylePrompt: params.stylePrompt,
+    speed: params.speed,
     masteringPreset: params.masteringPreset,
+    timingSource: params.timingSource,
+    timingConfidence: params.timingConfidence,
     wordTimings: params.wordTimings,
     phraseTimings: params.phraseTimings,
     speechEnvelope: params.speechEnvelope,
+    waveformPeaks: params.waveformPeaks,
     segments: params.segments,
     createdAt: (/* @__PURE__ */ new Date()).toISOString()
   };
@@ -515,7 +535,19 @@ function saveStoredClip(params) {
   return record;
 }
 function getClipRecord(id) {
-  return stateCache.clips.find((c) => c.id === id);
+  const cached = stateCache.clips.find((c) => c.id === id);
+  if (cached) return cached;
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      if (Array.isArray(parsed.clips)) {
+        stateCache.clips = parsed.clips;
+        return stateCache.clips.find((c) => c.id === id);
+      }
+    }
+  } catch {
+  }
+  return void 0;
 }
 function getClipAudioBuffer(id, preferWav = false) {
   const record = getClipRecord(id);
@@ -605,6 +637,7 @@ function deleteProjectClip(projectId, clipId) {
 }
 
 // src/server/ttsService.ts
+import crypto2 from "node:crypto";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 // src/utils/pronunciationAndEmotion.ts
@@ -841,54 +874,70 @@ function buildStyleInstruction(params) {
   }
   return parts.join(". ");
 }
-function splitLongScriptIntoChunks(text, maxChunkChars = 3500) {
+function splitLongScriptIntoChunkPlans(text, maxChunkChars = 3500) {
   const trimmed = text.trim();
   if (!trimmed) return [];
-  if (trimmed.length <= maxChunkChars) return [trimmed];
   const paragraphs = trimmed.split(/\n+/).map((p) => p.trim()).filter(Boolean);
-  const chunks = [];
-  let current = "";
-  const pushSentencewise = (block) => {
-    const sentences = block.split(/(?<=[.!?।])\s+/u).map((s) => s.trim()).filter(Boolean);
-    for (const sentence of sentences) {
+  const plans = [];
+  let activeEmotion;
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx += 1) {
+    let para = paragraphs[pIdx];
+    const emotionMatch = para.match(/^\[([A-Z_]{2,24})\]\s*/);
+    if (emotionMatch) {
+      activeEmotion = emotionMatch[1];
+    } else if (activeEmotion && pIdx > 0 && !/^\[([A-Z_]{2,24})\]/.test(para)) {
+    }
+    const isLastPara = pIdx === paragraphs.length - 1;
+    const paraBreakMs = isLastPara ? 0 : 220;
+    if (para.length <= maxChunkChars) {
+      const prev = plans[plans.length - 1];
+      if (prev && !emotionMatch && prev.text.length + 1 + para.length <= maxChunkChars && plans.length === pIdx) {
+        prev.text = `${prev.text}
+${para}`;
+        prev.breakAfterMs = paraBreakMs;
+      } else {
+        plans.push({ text: para, breakAfterMs: paraBreakMs, emotion: activeEmotion });
+      }
+      continue;
+    }
+    const sentences = para.split(/(?<=[.!?।])\s+/u).map((s) => s.trim()).filter(Boolean);
+    let current = "";
+    for (let sIdx = 0; sIdx < sentences.length; sIdx += 1) {
+      const sentence = sentences[sIdx];
+      const sentEmotion = sentence.match(/^\[([A-Z_]{2,24})\]\s*/);
+      if (sentEmotion) activeEmotion = sentEmotion[1];
       if (sentence.length > maxChunkChars) {
+        if (current) {
+          plans.push({ text: current, breakAfterMs: 130, emotion: activeEmotion });
+          current = "";
+        }
         for (let i = 0; i < sentence.length; i += maxChunkChars) {
           const slice = sentence.slice(i, i + maxChunkChars).trim();
           if (slice) {
-            if (current) {
-              chunks.push(current);
-              current = "";
-            }
-            chunks.push(slice);
+            plans.push({
+              text: slice,
+              breakAfterMs: i + maxChunkChars >= sentence.length && sIdx === sentences.length - 1 ? paraBreakMs : 120,
+              emotion: activeEmotion
+            });
           }
         }
         continue;
       }
-      const next = current ? `${current} ${sentence}` : sentence;
-      if (next.length <= maxChunkChars) {
-        current = next;
+      const candidate = current ? `${current} ${sentence}` : sentence;
+      if (candidate.length <= maxChunkChars) {
+        current = candidate;
       } else {
-        if (current) chunks.push(current);
-        current = sentence;
+        if (current) {
+          plans.push({ text: current, breakAfterMs: 130, emotion: activeEmotion });
+        }
+        current = activeEmotion && !/^\[([A-Z_]{2,24})\]/.test(sentence) ? `[${activeEmotion}] ${sentence}` : sentence;
       }
     }
-  };
-  for (const para of paragraphs) {
-    const candidate = current ? `${current}
-${para}` : para;
-    if (candidate.length <= maxChunkChars) {
-      current = candidate;
-    } else if (para.length <= maxChunkChars) {
-      if (current) chunks.push(current);
-      current = para;
-    } else {
-      pushSentencewise(para);
+    if (current) {
+      plans.push({ text: current, breakAfterMs: paraBreakMs, emotion: activeEmotion });
     }
   }
-  if (current) {
-    chunks.push(current);
-  }
-  return chunks;
+  return plans;
 }
 function validateGeneratePayload(payload) {
   if (payload.mode === "multi") {
@@ -952,7 +1001,7 @@ function alignWordsToEnvelope(displayText, durationMs, envelope = []) {
     }
   }
   if (tokens.length === 0) {
-    return { wordTimings: [], phraseTimings: [] };
+    return { wordTimings: [], phraseTimings: [], timingSource: "estimated", timingConfidence: 0 };
   }
   const mergedWindows = [];
   for (const frame of envelope) {
@@ -964,47 +1013,168 @@ function alignWordsToEnvelope(displayText, durationMs, envelope = []) {
       mergedWindows.push({ startMs: frame.startMs, endMs: frame.endMs });
     }
   }
-  const activeWindows = mergedWindows.length > 0 ? mergedWindows : [{ startMs: 0, endMs: safeDurationMs }];
-  const totalActiveMs = activeWindows.reduce((acc, w) => acc + Math.max(20, w.endMs - w.startMs), 0);
-  const totalWeight = tokens.reduce((acc, t) => acc + t.weight, 0);
-  const mapActiveOffsetToMs = (offsetMs) => {
-    let remaining = Math.max(0, Math.min(totalActiveMs, offsetMs));
-    for (const win of activeWindows) {
-      const span = Math.max(20, win.endMs - win.startMs);
-      if (remaining <= span) {
-        return Math.round(win.startMs + remaining);
-      }
-      remaining -= span;
+  const hasAcousticWindows = envelope.length >= 4 && mergedWindows.length > 0;
+  const activeWindows = hasAcousticWindows ? mergedWindows : [{ startMs: 0, endMs: safeDurationMs }];
+  const clauseGroups = [];
+  let curClause = [];
+  for (const tok of tokens) {
+    curClause.push(tok);
+    if (/[.!?।,;:\u2014-]$/.test(tok.word) && curClause.length >= 2) {
+      clauseGroups.push(curClause);
+      curClause = [];
     }
-    return activeWindows[activeWindows.length - 1].endMs;
-  };
+  }
+  if (curClause.length > 0) clauseGroups.push(curClause);
   const wordTimings = [];
-  let cursorWeight = 0;
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    const startOffset = cursorWeight / totalWeight * totalActiveMs;
-    cursorWeight += token.weight;
-    const endOffset = cursorWeight / totalWeight * totalActiveMs;
-    const rawStartMs = mapActiveOffsetToMs(startOffset);
-    const rawEndMs = Math.max(rawStartMs + 40, mapActiveOffsetToMs(endOffset));
-    const clampedEndMs = Math.min(safeDurationMs, rawEndMs);
-    const clampedStartMs = Math.min(rawStartMs, Math.max(0, clampedEndMs - 30));
-    wordTimings.push({
-      word: token.word,
-      startMs: clampedStartMs,
-      endMs: clampedEndMs,
-      startSeconds: Number((clampedStartMs / 1e3).toFixed(3)),
-      endSeconds: Number((clampedEndMs / 1e3).toFixed(3)),
-      segmentIndex: token.segmentIndex,
-      emotion: token.emotion
-    });
+  if (hasAcousticWindows && activeWindows.length >= 2 && clauseGroups.length === activeWindows.length) {
+    for (let g = 0; g < clauseGroups.length; g += 1) {
+      const group = clauseGroups[g];
+      const win = activeWindows[g];
+      const span = Math.max(40, win.endMs - win.startMs);
+      const groupWeight = group.reduce((acc, t) => acc + t.weight, 0);
+      let cursor = 0;
+      for (const tok of group) {
+        const sMs = Math.round(win.startMs + cursor / groupWeight * span);
+        cursor += tok.weight;
+        const eMs = Math.max(sMs + 35, Math.min(safeDurationMs, Math.round(win.startMs + cursor / groupWeight * span)));
+        wordTimings.push({
+          word: tok.word,
+          startMs: sMs,
+          endMs: eMs,
+          startSeconds: Number((sMs / 1e3).toFixed(3)),
+          endSeconds: Number((eMs / 1e3).toFixed(3)),
+          segmentIndex: tok.segmentIndex,
+          emotion: tok.emotion
+        });
+      }
+    }
+  } else {
+    const totalActiveMs = activeWindows.reduce((acc, w) => acc + Math.max(20, w.endMs - w.startMs), 0);
+    const totalWeight = tokens.reduce((acc, t) => acc + t.weight, 0);
+    const mapActiveOffsetToMs = (offsetMs) => {
+      let remaining = Math.max(0, Math.min(totalActiveMs, offsetMs));
+      for (const win of activeWindows) {
+        const span = Math.max(20, win.endMs - win.startMs);
+        if (remaining <= span) {
+          return Math.round(win.startMs + remaining);
+        }
+        remaining -= span;
+      }
+      return activeWindows[activeWindows.length - 1].endMs;
+    };
+    let cursorWeight = 0;
+    for (let i = 0; i < tokens.length; i += 1) {
+      const token = tokens[i];
+      const startOffset = cursorWeight / totalWeight * totalActiveMs;
+      cursorWeight += token.weight;
+      const endOffset = cursorWeight / totalWeight * totalActiveMs;
+      const rawStartMs = mapActiveOffsetToMs(startOffset);
+      const rawEndMs = Math.max(rawStartMs + 40, mapActiveOffsetToMs(endOffset));
+      const clampedEndMs = Math.min(safeDurationMs, rawEndMs);
+      const clampedStartMs = Math.min(rawStartMs, Math.max(0, clampedEndMs - 30));
+      wordTimings.push({
+        word: token.word,
+        startMs: clampedStartMs,
+        endMs: clampedEndMs,
+        startSeconds: Number((clampedStartMs / 1e3).toFixed(3)),
+        endSeconds: Number((clampedEndMs / 1e3).toFixed(3)),
+        segmentIndex: token.segmentIndex,
+        emotion: token.emotion
+      });
+    }
   }
   const phraseTimings = groupWordsIntoPhrases(wordTimings, {
     maxLines: 2,
     maxCharsPerLine: 34,
     maxPhraseDurationMs: 3200
   });
-  return { wordTimings, phraseTimings };
+  const timingSource = hasAcousticWindows ? "forced_alignment" : "estimated";
+  const timingConfidence = hasAcousticWindows ? activeWindows.length === clauseGroups.length ? 0.88 : 0.78 : 0.45;
+  return { wordTimings, phraseTimings, timingSource, timingConfidence };
+}
+function alignWordsToWavPcm(displayText, pcm, sampleRate, channels = 1) {
+  const monoLen = channels > 1 ? Math.floor(pcm.length / channels) : pcm.length;
+  const durationMs = Math.max(200, Math.round(monoLen / Math.max(1, sampleRate) * 1e3));
+  const frameMs = 10;
+  const frameSamples = Math.max(40, Math.round(sampleRate * frameMs / 1e3));
+  const frameEnergy = [];
+  const envelope = [];
+  for (let s = 0; s < monoLen; s += frameSamples) {
+    const e = Math.min(monoLen, s + frameSamples);
+    let sumSq = 0;
+    for (let i = s; i < e; i += 1) {
+      let sampleVal = 0;
+      if (channels > 1) {
+        for (let c = 0; c < channels; c += 1) sampleVal += pcm[i * channels + c] || 0;
+        sampleVal /= channels;
+      } else {
+        sampleVal = pcm[i];
+      }
+      const norm = sampleVal / 32767;
+      sumSq += norm * norm;
+    }
+    const rms = Math.sqrt(sumSq / Math.max(1, e - s));
+    frameEnergy.push(rms);
+    const rmsDb = rms > 1e-6 ? Number((20 * Math.log10(rms)).toFixed(1)) : -96;
+    envelope.push({
+      startMs: Math.round(s / sampleRate * 1e3),
+      endMs: Math.round(e / sampleRate * 1e3),
+      speechActive: rmsDb > -38,
+      rmsDb,
+      duckGainDb: rmsDb > -38 ? -14 : 0
+    });
+  }
+  const base = alignWordsToEnvelope(displayText, durationMs, envelope);
+  if (base.wordTimings.length <= 1 || frameEnergy.length < 10) {
+    return base;
+  }
+  const smoothed = frameEnergy.map((_, idx) => {
+    const prev = frameEnergy[Math.max(0, idx - 1)];
+    const cur = frameEnergy[idx];
+    const next = frameEnergy[Math.min(frameEnergy.length - 1, idx + 1)];
+    return (prev + cur * 2 + next) / 4;
+  });
+  const searchFrames = 7;
+  const snapped = base.wordTimings.map((w) => ({ ...w }));
+  let troughSnaps = 0;
+  for (let i = 0; i < snapped.length - 1; i += 1) {
+    const cur = snapped[i];
+    const next = snapped[i + 1];
+    if (next.startMs - cur.endMs > 60) continue;
+    const boundaryMs = Math.round((cur.endMs + next.startMs) / 2);
+    const centerFrame = Math.round(boundaryMs / frameMs);
+    const minF = Math.max(1, centerFrame - searchFrames);
+    const maxF = Math.min(smoothed.length - 2, centerFrame + searchFrames);
+    let bestFrame = centerFrame;
+    let lowestEnergy = smoothed[centerFrame] ?? 1;
+    for (let f = minF; f <= maxF; f += 1) {
+      if (smoothed[f] < lowestEnergy) {
+        lowestEnergy = smoothed[f];
+        bestFrame = f;
+      }
+    }
+    const snappedMs = bestFrame * frameMs;
+    if (snappedMs > cur.startMs + 35 && snappedMs < next.endMs - 35) {
+      cur.endMs = snappedMs;
+      cur.endSeconds = Number((snappedMs / 1e3).toFixed(3));
+      next.startMs = snappedMs;
+      next.startSeconds = Number((snappedMs / 1e3).toFixed(3));
+      troughSnaps += 1;
+    }
+  }
+  const snapRatio = troughSnaps / Math.max(1, snapped.length - 1);
+  const confidence = base.timingSource === "forced_alignment" ? Number(Math.min(0.95, Math.max(0.76, 0.8 + snapRatio * 0.14)).toFixed(2)) : base.timingConfidence;
+  const phraseTimings = groupWordsIntoPhrases(snapped, {
+    maxLines: 2,
+    maxCharsPerLine: 34,
+    maxPhraseDurationMs: 3200
+  });
+  return {
+    wordTimings: snapped,
+    phraseTimings,
+    timingSource: base.timingSource,
+    timingConfidence: confidence
+  };
 }
 function wrapWordsToLines(words, maxCharsPerLine, maxLines) {
   const lines = [];
@@ -1086,7 +1256,7 @@ function generateSubtitles(opts) {
   const uppercase = opts.uppercase ?? isRainbow;
   const maxLines = opts.maxLines ?? (isRainbow ? 3 : 2);
   const maxCharsPerLine = opts.maxCharsPerLine ?? (isRainbow ? 22 : 38);
-  const maxPhraseDurationMs = opts.maxPhraseDurationMs ?? (isRainbow ? 2600 : 3800);
+  const maxPhraseDurationMs = opts.maxPhraseDurationMs ?? (typeof opts.maxDurationSeconds === "number" && opts.maxDurationSeconds > 0 ? Math.round(opts.maxDurationSeconds * 1e3) : isRainbow ? 2600 : 3800);
   const marginV = opts.safeAreaMarginV ?? (isRainbow ? 340 : 120);
   const phrases = groupWordsIntoPhrases(opts.wordTimings, {
     maxLines,
@@ -1159,6 +1329,228 @@ ${cues}`;
   return `${header}
 ${events.join("\n")}
 `;
+}
+
+// src/server/quotaError.ts
+var InputValidationError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.status = 400;
+    this.error_code = "INVALID_ARGUMENT";
+    this.retryable = false;
+    this.name = "InputValidationError";
+  }
+};
+var QuotaExhaustedError = class extends Error {
+  constructor(params) {
+    super(
+      params.message || "All configured TTS providers are currently unavailable. Enable billing or configure a fallback provider (OPENAI_API_KEY or ELEVENLABS_API_KEY) in Settings > Secrets."
+    );
+    this.status = 429;
+    this.error_code = "RESOURCE_EXHAUSTED";
+    this.retryable = true;
+    this.name = "QuotaExhaustedError";
+    this.attemptedModels = params.attemptedModels;
+    this.retryAfterSeconds = typeof params.retryAfterSeconds === "number" && params.retryAfterSeconds > 0 ? Math.round(params.retryAfterSeconds) : 3600;
+  }
+  toPayload() {
+    return {
+      status: 429,
+      error_code: "RESOURCE_EXHAUSTED",
+      retryable: true,
+      retryAfterSeconds: this.retryAfterSeconds,
+      attemptedModels: this.attemptedModels,
+      message: this.message
+    };
+  }
+};
+var modelCooldownUntil = /* @__PURE__ */ new Map();
+function markModelCooldown(model, retryAfterSeconds) {
+  const safeSeconds = Math.max(15, Math.min(86400, Math.round(retryAfterSeconds || 60)));
+  modelCooldownUntil.set(model, Date.now() + safeSeconds * 1e3);
+}
+function isModelOnCooldown(model) {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldownUntil.delete(model);
+    return false;
+  }
+  return true;
+}
+function getModelCooldownRemainingSec(model) {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1e3));
+}
+function parseJsonSafe(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    const idx = trimmed.indexOf("{");
+    if (idx === -1) return null;
+    try {
+      return JSON.parse(trimmed.slice(idx));
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+function collectErrorNodes(err) {
+  const nodes = [];
+  const queue = [err];
+  const seen = /* @__PURE__ */ new Set();
+  while (queue.length > 0 && nodes.length < 40) {
+    const cur = queue.shift();
+    if (!cur || seen.has(cur)) continue;
+    if (typeof cur === "string") {
+      nodes.push(cur);
+      const parsed = parseJsonSafe(cur);
+      if (parsed && typeof parsed === "object") {
+        queue.push(parsed);
+      }
+      continue;
+    }
+    if (typeof cur !== "object") continue;
+    seen.add(cur);
+    const obj = cur;
+    nodes.push(obj);
+    if (typeof obj.message === "string") {
+      nodes.push(obj.message);
+      const parsed = parseJsonSafe(obj.message);
+      if (parsed && typeof parsed === "object") {
+        queue.push(parsed);
+      }
+    }
+    if (obj.error) queue.push(obj.error);
+    if (obj.cause) queue.push(obj.cause);
+    if (obj.response) queue.push(obj.response);
+    if (obj.data) queue.push(obj.data);
+    if (obj.body) queue.push(obj.body);
+    if (Array.isArray(obj.details)) {
+      for (const d of obj.details) queue.push(d);
+    }
+  }
+  return nodes;
+}
+function isQuotaOrRateError(err) {
+  if (err instanceof QuotaExhaustedError) return true;
+  const nodes = collectErrorNodes(err);
+  for (const node of nodes) {
+    if (typeof node === "string") {
+      const lower = node.toLowerCase();
+      if (lower.includes("resource_exhausted") || lower.includes("quota") || lower.includes("rate limit") || lower.includes("rate_limit") || lower.includes("too many requests") || /\b429\b/.test(lower)) {
+        return true;
+      }
+      continue;
+    }
+    const status = node.status;
+    const code = node.code ?? node.statusCode;
+    const reason = typeof node.reason === "string" ? node.reason.toUpperCase() : "";
+    const errCode = typeof node.error_code === "string" ? node.error_code.toUpperCase() : "";
+    if (status === 429 || code === 429 || code === "429") return true;
+    if (typeof status === "string" && status.toUpperCase() === "RESOURCE_EXHAUSTED") return true;
+    if (errCode === "RESOURCE_EXHAUSTED") return true;
+    if (reason.includes("QUOTA") || reason.includes("RATE_LIMIT")) return true;
+  }
+  return false;
+}
+function extractRetryAfterSeconds(err) {
+  const nodes = collectErrorNodes(err);
+  for (const node of nodes) {
+    if (typeof node === "string") {
+      const retryMatch = node.match(/retry\s+in\s+(\d+(?:\.\d+)?)\s*s/i) || node.match(/retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)s?/i) || node.match(/retryAfterSeconds["']?\s*[:=]\s*(\d+)/i);
+      if (retryMatch) {
+        const val = Math.ceil(Number(retryMatch[1]));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+      continue;
+    }
+    if (typeof node.retryAfterSeconds === "number" && node.retryAfterSeconds > 0) {
+      return Math.ceil(node.retryAfterSeconds);
+    }
+    if (typeof node.retryDelay === "string") {
+      const match = node.retryDelay.match(/(\d+(?:\.\d+)?)/);
+      if (match) {
+        const val = Math.ceil(Number(match[1]));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+    }
+    if (node.headers && typeof node.headers === "object") {
+      const headers = node.headers;
+      const ra = headers["retry-after"] ?? headers["Retry-After"];
+      if (typeof ra === "string" || typeof ra === "number") {
+        const val = Math.ceil(Number(ra));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+    }
+  }
+  const fullText = nodes.filter((n) => typeof n === "string").join(" ").toLowerCase();
+  if (fullText.includes("perday") || fullText.includes("per_day") || fullText.includes("daily")) {
+    return 3600;
+  }
+  return 60;
+}
+function mapApiError(error) {
+  if (error instanceof QuotaExhaustedError) {
+    return error.toPayload();
+  }
+  if (error instanceof InputValidationError) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: error.message
+    };
+  }
+  const errObj = error;
+  const rawMessage = errObj?.message || "An unexpected speech synthesis error occurred.";
+  if (isQuotaOrRateError(error)) {
+    const retryAfterSeconds = extractRetryAfterSeconds(error);
+    return {
+      status: 429,
+      error_code: "RESOURCE_EXHAUSTED",
+      retryable: true,
+      retryAfterSeconds,
+      attemptedModels: Array.isArray(errObj?.attemptedModels) ? errObj.attemptedModels : void 0,
+      message: "All configured TTS providers are currently unavailable due to API quota or rate limits. Enable billing on your Google AI project or add a fallback provider key in Settings > Secrets."
+    };
+  }
+  if (rawMessage.includes("GEMINI_API_KEY")) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: rawMessage
+    };
+  }
+  const numericStatus = typeof errObj?.status === "number" ? errObj.status : typeof errObj?.code === "number" ? errObj.code : 500;
+  if (numericStatus === 403 || rawMessage.includes("PERMISSION_DENIED") || rawMessage.includes("API_KEY_INVALID")) {
+    return {
+      status: 403,
+      error_code: "PERMISSION_DENIED",
+      retryable: false,
+      message: "Gemini API authentication failed. Please verify your key in Settings > Secrets."
+    };
+  }
+  if (numericStatus === 400 || rawMessage.includes("INVALID_ARGUMENT")) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: rawMessage
+    };
+  }
+  return {
+    status: numericStatus >= 400 && numericStatus < 600 ? numericStatus : 500,
+    error_code: "INTERNAL",
+    retryable: numericStatus >= 500,
+    message: rawMessage
+  };
 }
 
 // src/server/wavAudio.ts
@@ -1613,33 +2005,48 @@ function getGeminiClient() {
     }
   });
 }
-function mapApiError(error) {
-  const errObj = error;
-  const rawMessage = errObj?.message || "An unexpected speech synthesis error occurred.";
-  const status = typeof errObj?.status === "number" ? errObj.status : typeof errObj?.code === "number" ? errObj.code : 500;
-  if (rawMessage.includes("GEMINI_API_KEY")) {
-    return { status: 400, message: rawMessage };
-  }
-  if (status === 403 || rawMessage.includes("PERMISSION_DENIED") || rawMessage.includes("API_KEY_INVALID")) {
-    return {
-      status: 403,
-      message: "Gemini API authentication failed. Please verify your key in Settings > Secrets."
-    };
-  }
-  if (status === 429 || rawMessage.includes("RESOURCE_EXHAUSTED")) {
-    return {
-      status: 429,
-      message: "Gemini TTS API quota exhausted on the current free-tier key. Select a billing-enabled API key in Settings > Secrets to lift free-tier daily caps."
-    };
-  }
-  return { status: status >= 400 && status < 600 ? status : 500, message: rawMessage };
+var chunkSynthesisCache = /* @__PURE__ */ new Map();
+var MAX_CHUNK_CACHE = 80;
+function makeChunkCacheKey(params) {
+  return crypto2.createHash("sha1").update(`${params.voiceName}|${params.styleInstruction}|${params.seed ?? ""}|${params.text}`).digest("hex");
 }
-function isQuotaOrRateError(err) {
-  const msg = String(err?.message || "");
-  const status = err?.status;
-  return status === 429 || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429");
+function saveChunkToCache(key, buffer, actualModel) {
+  chunkSynthesisCache.set(key, { buffer, actualModel, createdAt: Date.now() });
+  if (chunkSynthesisCache.size > MAX_CHUNK_CACHE) {
+    const oldestKey = chunkSynthesisCache.keys().next().value;
+    if (oldestKey) chunkSynthesisCache.delete(oldestKey);
+  }
 }
-async function callSingleSpeakerGeminiTts(params) {
+var GEMINI_STANDARD_CHAIN = [
+  "gemini-3.8-flash-lite-tts",
+  "gemini-2.5-flash-preview-tts",
+  "gemini-3.8-flash-tts",
+  "gemini-2.5-pro-preview-tts"
+];
+var GEMINI_EXPRESSIVE_CHAIN = [
+  "gemini-3.8-flash-tts",
+  "gemini-3.8-flash-lite-tts",
+  "gemini-2.5-flash-preview-tts",
+  "gemini-2.5-pro-preview-tts"
+];
+function buildCandidateChain(preferredModel, modelTier) {
+  const baseList = modelTier === "expressive" ? [...GEMINI_EXPRESSIVE_CHAIN] : [...GEMINI_STANDARD_CHAIN];
+  const ordered = [preferredModel, ...baseList.filter((m) => m !== preferredModel)];
+  if (process.env.OPENAI_API_KEY?.trim()) {
+    ordered.push("openai:gpt-4o-mini-tts");
+  }
+  if (process.env.ELEVENLABS_API_KEY?.trim()) {
+    ordered.push("elevenlabs:eleven_multilingual_v2");
+  }
+  return ordered;
+}
+function isModelNotFoundOrUnsupported(err) {
+  const obj = err;
+  const msg = String(obj?.message || "").toLowerCase();
+  const status = obj?.status ?? obj?.code;
+  return status === 404 || msg.includes("not found") || msg.includes("is not supported") || msg.includes("unknown model") || msg.includes("model_not_found");
+}
+async function callGeminiSingleTtsModel(params) {
   const config = {
     responseModalities: ["AUDIO"],
     speechConfig: {
@@ -1651,58 +2058,251 @@ async function callSingleSpeakerGeminiTts(params) {
   if (typeof params.seed === "number" && Number.isFinite(params.seed)) {
     config.seed = Math.round(params.seed);
   }
-  const invokeModel = (targetModel) => params.ai.models.generateContent({
-    model: targetModel,
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: params.text.trim(),
-            speechMetadata: {
-              style: params.styleInstruction || "Natural, clear voice delivery"
-            }
-          }
-        ]
-      }
-    ],
+  const isGemini25 = params.model.startsWith("gemini-2.5");
+  const cleanText = params.text.trim();
+  const partPayload = isGemini25 ? {
+    text: params.styleInstruction ? `Deliver with the following style (${params.styleInstruction}): ${cleanText}` : cleanText
+  } : {
+    text: cleanText,
+    speechMetadata: {
+      style: params.styleInstruction || "Natural, clear voice delivery"
+    }
+  };
+  const response = await params.ai.models.generateContent({
+    model: params.model,
+    contents: [{ role: "user", parts: [partPayload] }],
     config
   });
-  let response;
-  let actualModel = params.model;
-  try {
-    response = await invokeModel(params.model);
-  } catch (err) {
-    if (isQuotaOrRateError(err)) {
-      if (params.model === "gemini-3.8-flash-tts") {
-        actualModel = "gemini-3.8-flash-lite-tts";
-        response = await invokeModel("gemini-3.8-flash-lite-tts");
-      } else {
-        await new Promise((r) => setTimeout(r, 1400));
-        response = await invokeModel(params.model);
-      }
-    } else {
-      throw err;
-    }
-  }
   const parts = response.candidates?.[0]?.content?.parts ?? [];
   const audioPart = parts.find((p) => p.inlineData?.data);
   const base64Audio = audioPart?.inlineData?.data;
   if (!base64Audio) {
     const err = new Error(
-      "The speech model did not return audio data. Try simplifying the script or style prompt."
+      `Model ${params.model} did not return audio data.`
     );
     err.status = 502;
     throw err;
   }
-  return { buffer: Buffer.from(base64Audio, "base64"), actualModel };
+  const rawBuf = Buffer.from(base64Audio, "base64");
+  if (rawBuf.length >= 4 && rawBuf.toString("ascii", 0, 4) === "RIFF") {
+    return rawBuf;
+  }
+  const pcm16 = new Int16Array(
+    rawBuf.buffer,
+    rawBuf.byteOffset,
+    Math.floor(rawBuf.byteLength / 2)
+  );
+  return encodeWavBuffer(pcm16, 24e3, 1);
+}
+function mapVoiceToOpenAi(voiceName) {
+  switch (voiceName) {
+    case "Charon":
+      return "onyx";
+    case "Fenrir":
+      return "ash";
+    case "Puck":
+      return "echo";
+    case "Zephyr":
+      return "nova";
+    case "Kore":
+    default:
+      return "coral";
+  }
+}
+async function callOpenAiTts(params) {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY not configured");
+  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini-tts",
+      voice: mapVoiceToOpenAi(params.voiceName),
+      input: params.text.trim(),
+      instructions: params.styleInstruction || void 0,
+      response_format: "wav"
+    })
+  });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    const retryHeader = res.headers.get("retry-after");
+    const err = new Error(`OpenAI TTS failed (${res.status}): ${errBody}`);
+    err.status = res.status;
+    if (retryHeader) err.retryAfterSeconds = Number(retryHeader);
+    throw err;
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+async function callElevenLabsTts(params) {
+  const apiKey = process.env.ELEVENLABS_API_KEY?.trim();
+  if (!apiKey) throw new Error("ELEVENLABS_API_KEY not configured");
+  const voiceId = params.voiceName === "Charon" || params.voiceName === "Fenrir" ? "pNInz6obpgDQGcFmaJgB" : params.voiceName === "Puck" ? "TxGEqnHWrfWFTfGW9XjX" : "21m00Tcm4TlvDq8ikWAM";
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=pcm_24000`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        text: params.text.trim(),
+        model_id: "eleven_multilingual_v2"
+      })
+    }
+  );
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    const retryHeader = res.headers.get("retry-after");
+    const err = new Error(`ElevenLabs TTS failed (${res.status}): ${errBody}`);
+    err.status = res.status;
+    if (retryHeader) err.retryAfterSeconds = Number(retryHeader);
+    throw err;
+  }
+  const pcmBuf = Buffer.from(await res.arrayBuffer());
+  const pcm16 = new Int16Array(
+    pcmBuf.buffer,
+    pcmBuf.byteOffset,
+    Math.floor(pcmBuf.byteLength / 2)
+  );
+  return encodeWavBuffer(pcm16, 24e3, 1);
+}
+async function synthesizeSingleChunkAcrossProviders(params) {
+  if (params.useChunkCache) {
+    const key = makeChunkCacheKey(params);
+    const cached = chunkSynthesisCache.get(key);
+    if (cached) {
+      return { buffer: cached.buffer, actualModel: cached.actualModel };
+    }
+  }
+  const candidates = buildCandidateChain(params.preferredModel, params.modelTier);
+  const attemptedModels = [];
+  let sawQuota = false;
+  let maxRetryAfter = 0;
+  let lastNonQuotaError = null;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    if (isModelOnCooldown(candidate)) {
+      attemptedModels.push(candidate);
+      sawQuota = true;
+      maxRetryAfter = Math.max(maxRetryAfter, getModelCooldownRemainingSec(candidate));
+      continue;
+    }
+    attemptedModels.push(candidate);
+    try {
+      let buffer;
+      if (candidate === "openai:gpt-4o-mini-tts") {
+        buffer = await callOpenAiTts({
+          text: params.text,
+          voiceName: params.voiceName,
+          styleInstruction: params.styleInstruction
+        });
+      } else if (candidate === "elevenlabs:eleven_multilingual_v2") {
+        buffer = await callElevenLabsTts({
+          text: params.text,
+          voiceName: params.voiceName
+        });
+      } else {
+        buffer = await callGeminiSingleTtsModel({
+          ai: params.ai,
+          model: candidate,
+          text: params.text,
+          voiceName: params.voiceName,
+          styleInstruction: params.styleInstruction,
+          seed: params.seed
+        });
+      }
+      if (params.useChunkCache) {
+        const key = makeChunkCacheKey(params);
+        saveChunkToCache(key, buffer, candidate);
+      }
+      return { buffer, actualModel: candidate };
+    } catch (err) {
+      if (isQuotaOrRateError(err)) {
+        sawQuota = true;
+        const retrySec = extractRetryAfterSeconds(err);
+        maxRetryAfter = Math.max(maxRetryAfter, retrySec);
+        markModelCooldown(candidate, retrySec);
+        continue;
+      }
+      if (isModelNotFoundOrUnsupported(err)) {
+        lastNonQuotaError = err;
+        continue;
+      }
+      lastNonQuotaError = err;
+      const errStatus = err?.status;
+      if (i < candidates.length - 1 && (errStatus === 400 || errStatus === 502 || errStatus === 503)) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (sawQuota) {
+    throw new QuotaExhaustedError({
+      attemptedModels,
+      retryAfterSeconds: maxRetryAfter || 3600
+    });
+  }
+  if (lastNonQuotaError) {
+    throw lastNonQuotaError;
+  }
+  throw new QuotaExhaustedError({
+    attemptedModels,
+    retryAfterSeconds: 3600
+  });
+}
+async function generateTextWithFallback(params) {
+  const models = [params.primaryModel, params.fallbackModel || "gemini-2.5-flash"].filter(
+    (m, idx, arr) => Boolean(m) && arr.indexOf(m) === idx
+  );
+  const attemptedModels = [];
+  let sawQuota = false;
+  let maxRetryAfter = 0;
+  let lastError;
+  for (const model of models) {
+    if (isModelOnCooldown(model)) {
+      attemptedModels.push(model);
+      sawQuota = true;
+      maxRetryAfter = Math.max(maxRetryAfter, getModelCooldownRemainingSec(model));
+      continue;
+    }
+    attemptedModels.push(model);
+    try {
+      return await params.ai.models.generateContent({
+        model,
+        contents: params.contents,
+        config: params.config
+      });
+    } catch (err) {
+      if (isQuotaOrRateError(err)) {
+        sawQuota = true;
+        const retrySec = extractRetryAfterSeconds(err);
+        maxRetryAfter = Math.max(maxRetryAfter, retrySec);
+        markModelCooldown(model, retrySec);
+        continue;
+      }
+      lastError = err;
+      if (isModelNotFoundOrUnsupported(err)) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (sawQuota) {
+    throw new QuotaExhaustedError({
+      attemptedModels,
+      retryAfterSeconds: maxRetryAfter || 3600
+    });
+  }
+  throw lastError || new Error("Text model call failed.");
 }
 async function synthesizeSpeech(payload) {
   const validation = validateGeneratePayload(payload);
   if (!validation.valid) {
-    const err = new Error(validation.error || "Invalid synthesis payload.");
-    err.status = 400;
-    throw err;
+    throw new InputValidationError(validation.error || "Invalid synthesis payload.");
   }
   const mode = payload.mode === "multi" ? "multi" : "single";
   const language = payload.language || "en";
@@ -1735,6 +2335,7 @@ async function synthesizeSpeech(payload) {
   let displayTextForCaptions = "";
   let segmentsMeta;
   let alignedWordsFromSegments;
+  let segmentTimingConfidence;
   let stemsMeta;
   if (mode === "multi") {
     const nonEmptyLines = (payload.dialogueLines ?? []).filter((l) => l.text.trim().length > 0);
@@ -1789,42 +2390,51 @@ async function synthesizeSpeech(payload) {
           }
         };
       });
-      try {
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash-tts",
-          contents: [{ role: "user", parts }],
-          config: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              multiSpeakerVoiceConfig: {
-                speakerVoiceConfigs: [
-                  {
-                    speaker: spA.name,
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || "Puck" } }
-                  },
-                  {
-                    speaker: spB.name,
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || "Kore" } }
-                  }
-                ]
+      const nativeMultiModel = "gemini-3.8-flash-tts";
+      let nativeSuccess = false;
+      if (!isModelOnCooldown(nativeMultiModel)) {
+        try {
+          const response = await ai.models.generateContent({
+            model: nativeMultiModel,
+            contents: [{ role: "user", parts }],
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                multiSpeakerVoiceConfig: {
+                  speakerVoiceConfigs: [
+                    {
+                      speaker: spA.name,
+                      voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || "Puck" } }
+                    },
+                    {
+                      speaker: spB.name,
+                      voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || "Kore" } }
+                    }
+                  ]
+                }
               }
             }
+          });
+          const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
+          if (audioPart?.inlineData?.data) {
+            rawMasterWav = Buffer.from(audioPart.inlineData.data, "base64");
+            actualModelUsed = nativeMultiModel;
+            nativeSuccess = true;
           }
-        });
-        const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
-        if (!audioPart?.inlineData?.data) {
-          throw new Error("Multi-speaker synthesis returned empty audio.");
+        } catch (err) {
+          if (isQuotaOrRateError(err)) {
+            markModelCooldown(nativeMultiModel, extractRetryAfterSeconds(err));
+          } else if (!isModelNotFoundOrUnsupported(err)) {
+            throw err;
+          }
         }
-        rawMasterWav = Buffer.from(audioPart.inlineData.data, "base64");
-        actualModelUsed = "gemini-3.8-flash-tts";
-      } catch (err) {
-        if (!isQuotaOrRateError(err)) {
-          throw err;
-        }
+      }
+      if (!nativeSuccess) {
         const fallbackBuffers = [];
         for (const line of nonEmptyLines) {
           const speaker = line.speakerKey === keyA ? spA : spB;
           const pron = applyPronunciationRules(line.text.trim(), activePronunciations, language);
+          pron.appliedTerms.forEach((t) => appliedPronunciations.add(t));
           const speakerStyle = buildStyleInstruction({
             language,
             stylePrompt: speaker.style || "Natural conversational dialogue",
@@ -1835,13 +2445,15 @@ async function synthesizeSpeech(payload) {
             pronunciationPrompt: pron.pronunciationPrompt,
             emotionHint: getEmotionStyleHint(line.emotion)
           });
-          const resTurn = await callSingleSpeakerGeminiTts({
+          const resTurn = await synthesizeSingleChunkAcrossProviders({
             ai,
-            model: "gemini-3.8-flash-lite-tts",
+            preferredModel: "gemini-3.8-flash-lite-tts",
+            modelTier: "standard",
             text: pron.ttsText,
             voiceName: speaker.baseVoice || "Puck",
             styleInstruction: speakerStyle,
-            seed: payload.seed
+            seed: payload.seed,
+            useChunkCache: true
           });
           fallbackBuffers.push(resTurn.buffer);
           actualModelUsed = resTurn.actualModel;
@@ -1871,13 +2483,15 @@ async function synthesizeSpeech(payload) {
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: getEmotionStyleHint(line.emotion)
         });
-        const turnResult = await callSingleSpeakerGeminiTts({
+        const turnResult = await synthesizeSingleChunkAcrossProviders({
           ai,
-          model: actualModelUsed,
+          preferredModel: actualModelUsed,
+          modelTier,
           text: pron.ttsText,
           voiceName: sp.baseVoice || "Puck",
           styleInstruction,
-          seed: payload.seed
+          seed: payload.seed,
+          useChunkCache: true
         });
         actualModelUsed = turnResult.actualModel;
         lineBuffers.push(turnResult.buffer);
@@ -1904,9 +2518,12 @@ async function synthesizeSpeech(payload) {
             language,
             displayText: `${speakerName} stem`,
             masteringPreset,
+            timingSource: "estimated",
+            timingConfidence: 0.5,
             wordTimings: [],
             phraseTimings: [],
-            speechEnvelope: stemStitched.speechEnvelope
+            speechEnvelope: stemStitched.speechEnvelope,
+            waveformPeaks: stemStitched.waveformPeaks
           });
           stemsMeta.push({
             speaker: speakerName,
@@ -1940,13 +2557,15 @@ async function synthesizeSpeech(payload) {
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: seg.emotionPrompt
         });
-        const segRes = await callSingleSpeakerGeminiTts({
+        const segRes = await synthesizeSingleChunkAcrossProviders({
           ai,
-          model: actualModelUsed,
+          preferredModel: actualModelUsed,
+          modelTier,
           text: pron.ttsText,
           voiceName,
           styleInstruction: segStyle,
-          seed: payload.seed
+          seed: payload.seed,
+          useChunkCache: true
         });
         actualModelUsed = segRes.actualModel;
         const processedSeg = processWavAudio(segRes.buffer, {
@@ -1967,12 +2586,24 @@ async function synthesizeSpeech(payload) {
       rawMasterWav = stitched.wavBuffer;
       segmentsMeta = [];
       alignedWordsFromSegments = [];
+      let confSum = 0;
       for (let i = 0; i < segProcessedInfos.length; i += 1) {
         const info = segProcessedInfos[i];
         const offset = stitched.offsetsMs[i];
         const parsedSegWav = parseWavBuffer(info.wavBuffer);
-        const segEnv = extractSpeechEnvelope(parsedSegWav.pcm, parsedSegWav.sampleRate, parsedSegWav.channels, 25);
-        const segAlign = alignWordsToEnvelope(info.seg.displayText, info.durationMs, segEnv);
+        const segEnv = extractSpeechEnvelope(
+          parsedSegWav.pcm,
+          parsedSegWav.sampleRate,
+          parsedSegWav.channels,
+          25
+        );
+        const segAlign = alignWordsToWavPcm(
+          info.seg.displayText,
+          parsedSegWav.pcm,
+          parsedSegWav.sampleRate,
+          parsedSegWav.channels
+        );
+        confSum += segAlign.timingConfidence;
         const segRecord = saveStoredClip({
           wavBuffer: info.wavBuffer,
           format: "wav",
@@ -1985,10 +2616,15 @@ async function synthesizeSpeech(payload) {
           modelUsed: actualModelUsed,
           language,
           displayText: info.seg.displayText,
+          stylePrompt: payload.stylePrompt,
+          speed,
           masteringPreset,
+          timingSource: segAlign.timingSource,
+          timingConfidence: segAlign.timingConfidence,
           wordTimings: segAlign.wordTimings,
           phraseTimings: segAlign.phraseTimings,
-          speechEnvelope: segEnv
+          speechEnvelope: segEnv,
+          waveformPeaks: extractWaveformPeaks(parsedSegWav.pcm, parsedSegWav.channels, 120)
         });
         segmentsMeta.push({
           index: i,
@@ -2014,12 +2650,13 @@ async function synthesizeSpeech(payload) {
           });
         }
       }
+      segmentTimingConfidence = Number((confSum / Math.max(1, segProcessedInfos.length)).toFixed(2));
     } else {
       const pron = applyPronunciationRules(rawScript, activePronunciations, language);
       pron.appliedTerms.forEach((t) => appliedPronunciations.add(t));
       const singleEmotion = parsedSegments[0]?.emotionPrompt;
       const cleanTtsText = pron.ttsText.replace(/\[[A-Z_]{2,24}\]/g, "").replace(/\s+/g, " ").trim();
-      const styleInstruction = buildStyleInstruction({
+      const baseStyleInstruction = buildStyleInstruction({
         language,
         stylePrompt: payload.stylePrompt || "",
         customVoiceDescription: payload.customVoiceDescription,
@@ -2030,33 +2667,66 @@ async function synthesizeSpeech(payload) {
         pronunciationPrompt: pron.pronunciationPrompt,
         emotionHint: singleEmotion
       });
-      const chunks = splitLongScriptIntoChunks(cleanTtsText || pron.ttsText, 3500);
-      if (chunks.length <= 1) {
-        const singleRes = await callSingleSpeakerGeminiTts({
+      const chunkPlans = splitLongScriptIntoChunkPlans(pron.ttsText || cleanTtsText, 3500);
+      if (chunkPlans.length <= 1) {
+        const singleText = (chunkPlans[0]?.text || cleanTtsText || pron.ttsText).replace(/\[[A-Z_]{2,24}\]/g, "").replace(/\s+/g, " ").trim();
+        const singleRes = await synthesizeSingleChunkAcrossProviders({
           ai,
-          model: actualModelUsed,
-          text: chunks[0] || cleanTtsText || pron.ttsText,
+          preferredModel: actualModelUsed,
+          modelTier,
+          text: singleText,
           voiceName,
-          styleInstruction,
-          seed: payload.seed
+          styleInstruction: baseStyleInstruction,
+          seed: payload.seed,
+          useChunkCache: false
         });
         rawMasterWav = singleRes.buffer;
         actualModelUsed = singleRes.actualModel;
       } else {
         const chunkWavs = [];
-        for (const chunkText of chunks) {
-          const chunkRes = await callSingleSpeakerGeminiTts({
+        for (const plan of chunkPlans) {
+          const chunkCleanText = plan.text.replace(/\[[A-Z_]{2,24}\]/g, "").replace(/\s+/g, " ").trim();
+          if (!chunkCleanText) continue;
+          const chunkStyle = plan.emotion ? buildStyleInstruction({
+            language,
+            stylePrompt: payload.stylePrompt || "",
+            customVoiceDescription: payload.customVoiceDescription,
+            speed,
+            pitchRegister,
+            emotionIntensity,
+            expressiveControls: payload.expressiveControls,
+            pronunciationPrompt: pron.pronunciationPrompt,
+            emotionHint: getEmotionStyleHint(plan.emotion)
+          }) : baseStyleInstruction;
+          const chunkRes = await synthesizeSingleChunkAcrossProviders({
             ai,
-            model: actualModelUsed,
-            text: chunkText,
+            preferredModel: actualModelUsed,
+            modelTier,
+            text: chunkCleanText,
             voiceName,
-            styleInstruction,
-            seed: payload.seed
+            styleInstruction: chunkStyle,
+            seed: payload.seed,
+            useChunkCache: true
           });
           actualModelUsed = chunkRes.actualModel;
-          chunkWavs.push(chunkRes.buffer);
+          const cleanChunk = processWavAudio(chunkRes.buffer, {
+            targetSampleRate,
+            targetChannels: 1,
+            trimSilence: true,
+            normalize: false,
+            masteringPreset: "none"
+          });
+          chunkWavs.push(cleanChunk.wavBuffer);
         }
-        rawMasterWav = stitchWavBuffers(chunkWavs, 150, targetSampleRate, targetChannels).wavBuffer;
+        const averageGap = Math.round(
+          chunkPlans.slice(0, -1).reduce((acc, p) => acc + (p.breakAfterMs || 150), 0) / Math.max(1, chunkPlans.length - 1)
+        );
+        rawMasterWav = stitchWavBuffers(
+          chunkWavs,
+          Math.max(100, Math.min(260, averageGap || 150)),
+          targetSampleRate,
+          targetChannels
+        ).wavBuffer;
       }
     }
   }
@@ -2070,18 +2740,44 @@ async function synthesizeSpeech(payload) {
     durationToleranceSeconds: payload.durationToleranceSeconds,
     fitMode: payload.fitMode || "stretch"
   });
-  const aligned = alignedWordsFromSegments ? {
-    wordTimings: alignedWordsFromSegments,
-    phraseTimings: alignWordsToEnvelope(
+  const parsedMaster = parseWavBuffer(processed.wavBuffer);
+  let wordTimings;
+  let phraseTimings;
+  let timingSource;
+  let timingConfidence;
+  if (alignedWordsFromSegments) {
+    const origLastMs = alignedWordsFromSegments[alignedWordsFromSegments.length - 1]?.endMs || processed.durationMs;
+    const scale = origLastMs > 0 ? processed.durationMs / origLastMs : 1;
+    wordTimings = Math.abs(scale - 1) > 0.03 ? alignedWordsFromSegments.map((w) => {
+      const s = Math.round(w.startMs * scale);
+      const e = Math.max(s + 35, Math.min(processed.durationMs, Math.round(w.endMs * scale)));
+      return {
+        ...w,
+        startMs: s,
+        endMs: e,
+        startSeconds: Number((s / 1e3).toFixed(3)),
+        endSeconds: Number((e / 1e3).toFixed(3))
+      };
+    }) : alignedWordsFromSegments;
+    phraseTimings = alignWordsToEnvelope(
       displayTextForCaptions,
       processed.durationMs,
       processed.speechEnvelope
-    ).phraseTimings
-  } : alignWordsToEnvelope(
-    displayTextForCaptions,
-    processed.durationMs,
-    processed.speechEnvelope
-  );
+    ).phraseTimings;
+    timingSource = "forced_alignment";
+    timingConfidence = segmentTimingConfidence ?? 0.84;
+  } else {
+    const pcmAligned = alignWordsToWavPcm(
+      displayTextForCaptions,
+      parsedMaster.pcm,
+      processed.sampleRate,
+      processed.channels
+    );
+    wordTimings = pcmAligned.wordTimings;
+    phraseTimings = pcmAligned.phraseTimings;
+    timingSource = pcmAligned.timingSource;
+    timingConfidence = pcmAligned.timingConfidence;
+  }
   const encoded = await transcodeWavToFormat(processed.wavBuffer, format, bitrateKbps);
   const saved = saveStoredClip({
     wavBuffer: processed.wavBuffer,
@@ -2096,10 +2792,15 @@ async function synthesizeSpeech(payload) {
     modelUsed: actualModelUsed,
     language,
     displayText: displayTextForCaptions,
+    stylePrompt: payload.stylePrompt,
+    speed,
     masteringPreset,
-    wordTimings: aligned.wordTimings,
-    phraseTimings: aligned.phraseTimings,
+    timingSource,
+    timingConfidence,
+    wordTimings,
+    phraseTimings,
     speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks,
     segments: segmentsMeta
   });
   if (payload.projectId) {
@@ -2132,12 +2833,14 @@ async function synthesizeSpeech(payload) {
     modelUsed: actualModelUsed,
     voiceId,
     voiceName: voiceDisplayName,
+    voiceUsed: voiceDisplayName,
     durationEstimateSec: Math.max(1, Math.round(processed.durationMs / 1e3)),
     durationMs: processed.durationMs,
-    wordTimings: aligned.wordTimings,
-    phraseTimings: aligned.phraseTimings,
+    timingSource,
+    timingConfidence,
+    ...payload.returnWordTimings === false ? {} : { wordTimings, phraseTimings },
     speechEnvelope: processed.speechEnvelope,
-    waveformPeaks: processed.waveformPeaks,
+    ...payload.returnWaveformPeaks === false ? {} : { waveformPeaks: processed.waveformPeaks },
     segments: segmentsMeta,
     stems: stemsMeta,
     appliedPronunciations: Array.from(appliedPronunciations)
@@ -2146,13 +2849,14 @@ async function synthesizeSpeech(payload) {
 async function regenerateClipSegment(params) {
   const existing = getClipRecord(params.clipId);
   if (!existing || !existing.segments || !existing.segments[params.segmentIndex]) {
-    const err = new Error("Clip or segment index not found.");
-    err.status = 404;
-    throw err;
+    throw new InputValidationError("Clip or segment index not found.");
   }
   const segments = [...existing.segments];
   const targetSeg = segments[params.segmentIndex];
   const nextText = (params.text ?? targetSeg.text).trim();
+  if (!nextText) {
+    throw new InputValidationError("Replacement segment text cannot be empty.");
+  }
   const nextEmotion = params.emotion ?? targetSeg.emotion;
   const voicePreset = VOICE_PRESETS.find((v) => v.id === (params.voiceId || existing.voiceId)) ?? VOICE_PRESETS[0];
   const activePronunciations = listPronunciations();
@@ -2165,13 +2869,14 @@ async function regenerateClipSegment(params) {
     emotionHint: getEmotionStyleHint(nextEmotion)
   });
   const ai = getGeminiClient();
-  const preferredModel = existing.modelUsed === "gemini-3.8-flash-tts" ? "gemini-3.8-flash-tts" : "gemini-3.8-flash-lite-tts";
-  const segResult = await callSingleSpeakerGeminiTts({
+  const segResult = await synthesizeSingleChunkAcrossProviders({
     ai,
-    model: preferredModel,
+    preferredModel: existing.modelUsed || "gemini-3.8-flash-lite-tts",
+    modelTier: existing.modelUsed === "gemini-3.8-flash-tts" ? "expressive" : "standard",
     text: pron.ttsText,
     voiceName: voicePreset.baseVoice,
-    styleInstruction
+    styleInstruction,
+    useChunkCache: true
   });
   const processedNewSeg = processWavAudio(segResult.buffer, {
     targetSampleRate: existing.sampleRate,
@@ -2180,13 +2885,19 @@ async function regenerateClipSegment(params) {
     normalize: true,
     masteringPreset: existing.masteringPreset
   });
+  const parsedNewSeg = parseWavBuffer(processedNewSeg.wavBuffer);
   const segEnv = extractSpeechEnvelope(
-    parseWavBuffer(processedNewSeg.wavBuffer).pcm,
+    parsedNewSeg.pcm,
     existing.sampleRate,
     existing.channels,
     25
   );
-  const segAlign = alignWordsToEnvelope(nextText, processedNewSeg.durationMs, segEnv);
+  const segAlign = alignWordsToWavPcm(
+    nextText,
+    parsedNewSeg.pcm,
+    existing.sampleRate,
+    existing.channels
+  );
   const savedNewSeg = saveStoredClip({
     wavBuffer: processedNewSeg.wavBuffer,
     format: "wav",
@@ -2200,9 +2911,12 @@ async function regenerateClipSegment(params) {
     language: existing.language,
     displayText: nextText,
     masteringPreset: existing.masteringPreset,
+    timingSource: segAlign.timingSource,
+    timingConfidence: segAlign.timingConfidence,
     wordTimings: segAlign.wordTimings,
     phraseTimings: segAlign.phraseTimings,
-    speechEnvelope: segEnv
+    speechEnvelope: segEnv,
+    waveformPeaks: extractWaveformPeaks(parsedNewSeg.pcm, existing.channels, 120)
   });
   segments[params.segmentIndex] = {
     index: params.segmentIndex,
@@ -2267,9 +2981,12 @@ async function regenerateClipSegment(params) {
     language: existing.language,
     displayText: fullDisplayText,
     masteringPreset: existing.masteringPreset,
+    timingSource: "forced_alignment",
+    timingConfidence: segAlign.timingConfidence,
     wordTimings: combinedWords,
     phraseTimings: fullPhraseTimings,
     speechEnvelope: stitched.speechEnvelope,
+    waveformPeaks: stitched.waveformPeaks,
     segments: updatedSegments
   });
   return {
@@ -2285,8 +3002,11 @@ async function regenerateClipSegment(params) {
     modelUsed: savedMaster.modelUsed,
     voiceId: savedMaster.voiceId,
     voiceName: savedMaster.voiceName,
+    voiceUsed: savedMaster.voiceName,
     durationEstimateSec: Math.max(1, Math.round(stitched.durationMs / 1e3)),
     durationMs: stitched.durationMs,
+    timingSource: "forced_alignment",
+    timingConfidence: segAlign.timingConfidence,
     wordTimings: combinedWords,
     phraseTimings: fullPhraseTimings,
     speechEnvelope: stitched.speechEnvelope,
@@ -2296,15 +3016,15 @@ async function regenerateClipSegment(params) {
 }
 async function translateSpeechScript(text, targetLanguage, preserveDuration = false) {
   if (!text || !text.trim()) {
-    const err = new Error("Enter text to translate or adapt.");
-    err.status = 400;
-    throw err;
+    throw new InputValidationError("Enter text to translate or adapt.");
   }
   const ai = getGeminiClient();
   const targetDesc = targetLanguage === "hi" ? "natural, spoken Hindi in Devanagari script (\u0939\u093F\u0928\u094D\u0926\u0940)" : targetLanguage === "bilingual" ? "natural urban Hinglish (blending Hindi in Devanagari with conversational English phrases where natural)" : "natural, expressive English";
   const durationRule = preserveDuration ? " Match the approximate spoken syllable count and sentence pacing of the source so the localized voiceover fits the same video duration." : "";
-  const response = await ai.models.generateContent({
-    model: "gemini-4-hydrogen",
+  const response = await generateTextWithFallback({
+    ai,
+    primaryModel: "gemini-4-hydrogen",
+    fallbackModel: "gemini-2.5-flash",
     contents: `Translate or adapt the following voiceover script into ${targetDesc}.${durationRule} Preserve any inline vocal tags like <breath>, <laugh>, <chuckle>, <sigh>, <gasp>, |yeah|, |mhm|, or [CURIOUS]/[AWE] exactly as written. Return ONLY the adapted script text with no commentary or quotes.
 
 Script:
@@ -2322,6 +3042,9 @@ ${text.trim()}`,
   return translatedText;
 }
 async function localizeNarration(params) {
+  if (!params.text?.trim()) {
+    throw new InputValidationError("Script text is required for localization.");
+  }
   const srcStats = countWordsAndChars(params.text);
   const targetSec = params.targetDurationSeconds || (params.preserveDuration ? Math.max(2, srcStats.estimatedSeconds) : void 0);
   const outputs = [];
@@ -2362,7 +3085,7 @@ async function resolveInputAudioBuffer(input) {
   if (input.clipId) {
     const found = getClipAudioBuffer(input.clipId, true);
     if (!found) {
-      throw new Error(`Audio clip '${input.clipId}' was not found.`);
+      throw new InputValidationError(`Audio clip '${input.clipId}' was not found.`);
     }
     return {
       buffer: found.buffer,
@@ -2389,12 +3112,14 @@ async function resolveInputAudioBuffer(input) {
       mimeType: res.headers.get("content-type") || input.audioFile?.mime_type || "audio/wav"
     };
   }
-  throw new Error("Provide clipId, audioBase64, audioUrl, or an attached audioFile.");
+  throw new InputValidationError("Provide clipId, audioBase64, audioUrl, or an attached audioFile.");
 }
 async function transcribeAudioBuffer(buffer, mimeType = "audio/wav") {
   const ai = getGeminiClient();
-  const response = await ai.models.generateContent({
-    model: "gemini-3.5-transcribe",
+  const response = await generateTextWithFallback({
+    ai,
+    primaryModel: "gemini-3.5-transcribe",
+    fallbackModel: "gemini-2.5-flash",
     contents: {
       parts: [
         {
@@ -2412,8 +3137,10 @@ async function transcribeAudioBuffer(buffer, mimeType = "audio/wav") {
 async function analyzeVoiceBuffer(buffer, mimeType = "audio/wav") {
   const ai = getGeminiClient();
   const parsed = parseWavBuffer(buffer);
-  const response = await ai.models.generateContent({
-    model: "gemini-4-hydrogen",
+  const response = await generateTextWithFallback({
+    ai,
+    primaryModel: "gemini-4-hydrogen",
+    fallbackModel: "gemini-2.5-flash",
     contents: {
       parts: [
         { inlineData: { mimeType, data: buffer.toString("base64") } },
@@ -2469,7 +3196,8 @@ async function matchAudioDuration(params) {
     fitMode: "stretch"
   });
   const displayText = params.sourceText || "";
-  const aligned = alignWordsToEnvelope(displayText, processed.durationMs, processed.speechEnvelope);
+  const parsedMaster = parseWavBuffer(processed.wavBuffer);
+  const aligned = alignWordsToWavPcm(displayText, parsedMaster.pcm, rate, ch);
   const saved = saveStoredClip({
     wavBuffer: processed.wavBuffer,
     format: "wav",
@@ -2483,9 +3211,12 @@ async function matchAudioDuration(params) {
     language: "bilingual",
     displayText,
     masteringPreset: params.masteringPreset || "none",
+    timingSource: aligned.timingSource,
+    timingConfidence: aligned.timingConfidence,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
-    speechEnvelope: processed.speechEnvelope
+    speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks
   });
   return {
     clipId: saved.id,
@@ -2500,8 +3231,11 @@ async function matchAudioDuration(params) {
     modelUsed: "svara-wsola-dsp",
     voiceId: "matched",
     voiceName: "Time-Matched Audio",
+    voiceUsed: "Time-Matched Audio",
     durationEstimateSec: Math.max(1, Math.round(processed.durationMs / 1e3)),
     durationMs: processed.durationMs,
+    timingSource: aligned.timingSource,
+    timingConfidence: aligned.timingConfidence,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope: processed.speechEnvelope,
@@ -2509,6 +3243,9 @@ async function matchAudioDuration(params) {
   };
 }
 async function replaceAudioSegmentFromBuffer(params) {
+  if (!params.replacementText?.trim()) {
+    throw new InputValidationError("Replacement text cannot be empty.");
+  }
   const rate = params.sampleRate || 48e3;
   const ch = params.channels === 2 ? 2 : 1;
   const parsedOrig = parseWavBuffer(params.buffer);
@@ -2546,7 +3283,7 @@ async function replaceAudioSegmentFromBuffer(params) {
   const durationMs = Math.round(combined.length / rate * 1e3);
   const speechEnvelope = extractSpeechEnvelope(combined, rate, 1, 25);
   const waveformPeaks = extractWaveformPeaks(combined, 1, 120);
-  const aligned = alignWordsToEnvelope(params.replacementText, durationMs, speechEnvelope);
+  const aligned = alignWordsToWavPcm(params.replacementText, combined, rate, 1);
   const saved = saveStoredClip({
     wavBuffer: finalWav,
     format: "wav",
@@ -2560,9 +3297,12 @@ async function replaceAudioSegmentFromBuffer(params) {
     language: params.language || "en",
     displayText: params.replacementText,
     masteringPreset: "none",
+    timingSource: aligned.timingSource,
+    timingConfidence: aligned.timingConfidence,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
-    speechEnvelope
+    speechEnvelope,
+    waveformPeaks
   });
   return {
     clipId: saved.id,
@@ -2577,8 +3317,11 @@ async function replaceAudioSegmentFromBuffer(params) {
     modelUsed: repRes.modelUsed,
     voiceId: preset.id,
     voiceName: `${preset.name} (${preset.roleTitle})`,
+    voiceUsed: `${preset.name} (${preset.roleTitle})`,
     durationEstimateSec: Math.max(1, Math.round(durationMs / 1e3)),
     durationMs,
+    timingSource: aligned.timingSource,
+    timingConfidence: aligned.timingConfidence,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope,
@@ -2587,13 +3330,35 @@ async function replaceAudioSegmentFromBuffer(params) {
 }
 
 // src/mcp/createSvaraMcpServer.ts
-var SVARA_MCP_INSTRUCTIONS = `Svara Studio is a bilingual English, Hindi (\u0939\u093F\u0928\u094D\u0926\u0940), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
+var SVARA_MCP_VERSION = "2.2.0";
+var SVARA_MCP_BUILD = "2026-11-16.2";
+var SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (\u0939\u093F\u0928\u094D\u0926\u0940), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
 Recommended creator workflow:
 1. Discover voices via list_voices or inspect saved presets via list_voice_presets, and audition quickly with preview_voice.
 2. Register proper nouns or tricky words once with add_pronunciation so English and Hindi scripts speak them cleanly.
-3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns both a native MCP file resource/resource_link and structured metadata including wordTimings, phraseTimings, and speechEnvelope (for music ducking).
-4. Generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions directly from any clipId via generate_subtitles without re-transcribing.
+3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordTimings, waveformPeaks, timingSource, timingConfidence, and speechEnvelope.
+4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions via generate_subtitles without re-transcribing.
 5. Use localize_narration for simultaneous Hindi/Hinglish/English dubs, or pass existing files via audioFile/clipId to transcribe_audio, dub_audio, match_duration, analyze_voice, and replace_segment.`;
+function handleMcpToolError(error) {
+  const mapped = mapApiError(error);
+  const errorPayload = {
+    error_code: mapped.error_code,
+    retryable: mapped.retryable,
+    ...typeof mapped.retryAfterSeconds === "number" ? { retryAfterSeconds: mapped.retryAfterSeconds } : {},
+    ...mapped.attemptedModels?.length ? { attemptedModels: mapped.attemptedModels } : {},
+    message: mapped.message
+  };
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(errorPayload, null, 2)
+      }
+    ],
+    structuredContent: errorPayload
+  };
+}
 function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
   const base = publicBaseUrl.replace(/\/$/, "");
   const fullAudioUrl = `${base}${res.audioUrl}`;
@@ -2601,6 +3366,9 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
   const ext = res.format || "wav";
   const fileName = `svara-${res.clipId}.${ext}`;
   const resourceUri = `svara://clips/${fileName}`;
+  const durationMs = res.durationMs ?? (res.durationEstimateSec || 1) * 1e3;
+  const durationSeconds = Number((durationMs / 1e3).toFixed(2));
+  const voiceUsed = res.voiceUsed || res.voiceName || "Svara Voice";
   const structuredPayload = {
     status: "synthesized",
     clipId: res.clipId,
@@ -2618,18 +3386,23 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
     audioUrl: fullAudioUrl,
     downloadUrl: fullDownloadUrl,
     mimeType: res.mimeType,
-    durationMs: res.durationMs ?? (res.durationEstimateSec || 1) * 1e3,
-    durationSeconds: Number(((res.durationMs ?? res.durationEstimateSec * 1e3) / 1e3).toFixed(2)),
+    format: ext,
+    durationMs,
+    durationSeconds,
     sampleRate: res.sampleRate ?? 48e3,
     channels: res.channels ?? 1,
     voiceId: res.voiceId,
     voiceName: res.voiceName,
+    voiceUsed,
     model: res.modelUsed,
+    modelUsed: res.modelUsed,
+    timingSource: res.timingSource || "forced_alignment",
+    timingConfidence: res.timingConfidence ?? 0.85,
     appliedPronunciations: res.appliedPronunciations ?? [],
-    wordTimings: res.wordTimings ?? [],
-    phraseTimings: res.phraseTimings ?? [],
-    speechEnvelope: res.speechEnvelope ?? [],
+    ...res.wordTimings ? { wordTimings: res.wordTimings } : {},
+    ...res.phraseTimings ? { phraseTimings: res.phraseTimings } : {},
     ...res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {},
+    speechEnvelope: res.speechEnvelope ?? [],
     ...res.segments ? { segments: res.segments } : {},
     ...res.stems ? { stems: res.stems } : {},
     ...extraMeta
@@ -2639,12 +3412,17 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
       type: "resource_link",
       uri: fullDownloadUrl,
       name: fileName,
-      title: `${res.voiceName || "Svara"} (${ext.toUpperCase()})`,
+      title: `${voiceUsed} (${ext.toUpperCase()})`,
       mimeType: res.mimeType,
       size: res.sizeBytes
     }
   ];
   if (res.audioBase64 && res.audioBase64.length <= 16e6) {
+    content.push({
+      type: "audio",
+      data: res.audioBase64,
+      mimeType: res.mimeType
+    });
     content.push({
       type: "resource",
       resource: {
@@ -2654,9 +3432,12 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
       }
     });
   }
+  const rateKhz = ((res.sampleRate ?? 48e3) / 1e3).toFixed(res.sampleRate === 44100 ? 1 : 0);
+  const channelLabel = res.channels === 2 ? "stereo" : "mono";
+  const wordCount = res.wordTimings?.length ?? 0;
   content.push({
     type: "text",
-    text: JSON.stringify(structuredPayload, null, 2)
+    text: `Synthesized ${durationSeconds}s ${ext.toUpperCase()} (${rateKhz} kHz ${channelLabel}) with ${voiceUsed} via ${res.modelUsed}. Clip ID: ${res.clipId} \xB7 Words: ${wordCount} (${structuredPayload.timingSource}). Download: ${fullDownloadUrl}`
   });
   return {
     content,
@@ -2684,7 +3465,7 @@ function createSvaraMcpServer(publicBaseUrl) {
   const server = new McpServer(
     {
       name: "svara-studio",
-      version: "2.0.0"
+      version: SVARA_MCP_VERSION
     },
     {
       instructions: SVARA_MCP_INSTRUCTIONS
@@ -2793,7 +3574,12 @@ function createSvaraMcpServer(publicBaseUrl) {
         description: v.description
       }));
       return {
-        content: [{ type: "text", text: JSON.stringify({ count: voices.length, voices }, null, 2) }],
+        content: [
+          {
+            type: "text",
+            text: `Found ${voices.length} Svara Studio voices (${voices.slice(0, 5).map((v) => `${v.id}: ${v.name}`).join(", ")}${voices.length > 5 ? ", ..." : ""}).`
+          }
+        ],
         structuredContent: { count: voices.length, voices }
       };
     }
@@ -2810,34 +3596,39 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async ({ voiceId, sampleText, stylePrompt }) => {
-      const preset = VOICE_PRESETS.find((v) => v.id === voiceId) ?? VOICE_PRESETS[0];
-      const res = await synthesizeSpeech({
-        mode: "single",
-        language: preset.sampleLanguage,
-        modelTier: "standard",
-        text: sampleText?.trim() || preset.sampleText,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: stylePrompt || preset.defaultStyle,
-        speed: 1,
-        sampleRate: 48e3,
-        channels: 1,
-        normalize: true,
-        trimSilence: true
-      });
-      return buildAudioToolResult(publicBaseUrl, res, { previewOf: preset.id });
+      try {
+        const preset = VOICE_PRESETS.find((v) => v.id === voiceId) ?? VOICE_PRESETS[0];
+        const res = await synthesizeSpeech({
+          mode: "single",
+          language: preset.sampleLanguage,
+          modelTier: "standard",
+          text: sampleText?.trim() || preset.sampleText,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: stylePrompt || preset.defaultStyle,
+          speed: 1,
+          sampleRate: 48e3,
+          channels: 1,
+          normalize: true,
+          trimSilence: true
+        });
+        return buildAudioToolResult(publicBaseUrl, res, { previewOf: preset.id });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
     "generate_speech",
     {
       title: "Generate Production Speech & Native Audio File",
-      description: "Synthesize creator-ready speech in English, Hindi, or Hinglish. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, silence trimming, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native audio file output + word/phrase timestamps + speechEnvelope.",
+      description: "Synthesize creator-ready speech in English, Hindi, or Hinglish with automatic multi-model/provider fallback routing. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native MCP audio + resource_link + forced-aligned wordTimings + waveformPeaks + speechEnvelope.",
       inputSchema: {
         text: z.string().min(1),
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe("Optional saved preset ID or name from list_voice_presets."),
         language: z.enum(["en", "hi", "bilingual"]).optional(),
+        modelTier: z.enum(["standard", "expressive"]).optional(),
         stylePrompt: z.string().optional(),
         customVoiceDescription: z.string().optional(),
         speed: z.number().min(0.7).max(1.4).optional(),
@@ -2845,7 +3636,8 @@ function createSvaraMcpServer(publicBaseUrl) {
         emotionIntensity: z.enum(["subtle", "natural", "dramatic"]).optional(),
         expressiveControls: ExpressiveControlsSchema,
         seed: z.number().int().optional(),
-        format: z.enum(["wav", "mp3", "m4a", "flac"]).optional().default("wav"),
+        format: z.enum(["wav", "mp3", "m4a", "flac"]).optional(),
+        outputFormat: z.enum(["wav", "mp3", "m4a", "flac"]).optional(),
         sampleRate: z.union([z.literal(24e3), z.literal(44100), z.literal(48e3)]).optional().default(48e3),
         channels: z.union([z.literal(1), z.literal(2)]).optional().default(1),
         bitrateKbps: z.number().min(64).max(320).optional(),
@@ -2855,42 +3647,127 @@ function createSvaraMcpServer(publicBaseUrl) {
         targetDurationSeconds: z.number().min(0.5).max(300).optional(),
         durationToleranceSeconds: z.number().min(0.05).max(5).optional(),
         fitMode: z.enum(["natural", "tight", "stretch"]).optional(),
+        returnWordTimings: z.boolean().optional().default(true),
+        returnWaveformPeaks: z.boolean().optional().default(true),
         projectId: z.string().optional()
       }
     },
     async (args) => {
-      const savedPreset = args.voicePresetId ? getVoicePreset(args.voicePresetId) : void 0;
-      const language = args.language ?? savedPreset?.language ?? "en";
-      const fallbackVoiceId = language === "hi" ? "aarav" : language === "bilingual" ? "vikram" : "ethan";
-      const effectiveVoiceId = args.voiceId ?? savedPreset?.voiceId ?? fallbackVoiceId;
-      const preset = VOICE_PRESETS.find((v) => v.id === effectiveVoiceId) ?? VOICE_PRESETS[0];
-      const res = await synthesizeSpeech({
-        mode: "single",
-        language,
-        modelTier: args.expressiveControls || args.customVoiceDescription ? "expressive" : "standard",
-        text: args.text,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: args.stylePrompt ?? savedPreset?.stylePrompt ?? preset.defaultStyle,
-        customVoiceDescription: args.customVoiceDescription ?? savedPreset?.customVoiceDescription,
-        speed: args.speed ?? savedPreset?.speed ?? 1,
-        pitchRegister: args.pitchRegister ?? savedPreset?.pitchRegister ?? "balanced",
-        emotionIntensity: args.emotionIntensity ?? savedPreset?.emotionIntensity ?? "natural",
-        expressiveControls: args.expressiveControls ?? savedPreset?.expressiveControls,
-        seed: args.seed,
-        format: args.format,
-        sampleRate: args.sampleRate ?? savedPreset?.sampleRate ?? 48e3,
-        channels: args.channels ?? savedPreset?.channels ?? 1,
-        bitrateKbps: args.bitrateKbps,
-        normalize: args.normalize,
-        trimSilence: args.trimSilence,
-        masteringPreset: args.masteringPreset !== "none" ? args.masteringPreset : savedPreset?.masteringPreset ?? "none",
-        targetDurationSeconds: args.targetDurationSeconds,
-        durationToleranceSeconds: args.durationToleranceSeconds,
-        fitMode: args.fitMode,
-        projectId: args.projectId
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const savedPreset = args.voicePresetId ? getVoicePreset(args.voicePresetId) : void 0;
+        const language = args.language ?? savedPreset?.language ?? "en";
+        const fallbackVoiceId = language === "hi" ? "aarav" : language === "bilingual" ? "vikram" : "ethan";
+        const effectiveVoiceId = args.voiceId ?? savedPreset?.voiceId ?? fallbackVoiceId;
+        const preset = VOICE_PRESETS.find((v) => v.id === effectiveVoiceId) ?? VOICE_PRESETS[0];
+        const chosenFormat = args.format ?? args.outputFormat ?? "wav";
+        const chosenTier = args.modelTier ?? (args.expressiveControls || args.customVoiceDescription ? "expressive" : "standard");
+        const res = await synthesizeSpeech({
+          mode: "single",
+          language,
+          modelTier: chosenTier,
+          text: args.text,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: args.stylePrompt ?? savedPreset?.stylePrompt ?? preset.defaultStyle,
+          customVoiceDescription: args.customVoiceDescription ?? savedPreset?.customVoiceDescription,
+          speed: args.speed ?? savedPreset?.speed ?? 1,
+          pitchRegister: args.pitchRegister ?? savedPreset?.pitchRegister ?? "balanced",
+          emotionIntensity: args.emotionIntensity ?? savedPreset?.emotionIntensity ?? "natural",
+          expressiveControls: args.expressiveControls ?? savedPreset?.expressiveControls,
+          seed: args.seed,
+          format: chosenFormat,
+          sampleRate: args.sampleRate ?? savedPreset?.sampleRate ?? 48e3,
+          channels: args.channels ?? savedPreset?.channels ?? 1,
+          bitrateKbps: args.bitrateKbps,
+          normalize: args.normalize,
+          trimSilence: args.trimSilence,
+          masteringPreset: args.masteringPreset !== "none" ? args.masteringPreset : savedPreset?.masteringPreset ?? "none",
+          targetDurationSeconds: args.targetDurationSeconds,
+          durationToleranceSeconds: args.durationToleranceSeconds,
+          fitMode: args.fitMode,
+          returnWordTimings: args.returnWordTimings,
+          returnWaveformPeaks: args.returnWaveformPeaks,
+          projectId: args.projectId
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
+    }
+  );
+  server.registerTool(
+    "get_clip",
+    {
+      title: "Retrieve Saved Clip Audio & Metadata",
+      description: "Retrieve a previously generated Svara Studio clip by clipId, returning a fresh audio attachment, download URL, script, voiceUsed, modelUsed, durationMs, timingSource, timingConfidence, wordTimings, and waveformPeaks.",
+      inputSchema: {
+        clipId: z.string().min(1)
+      }
+    },
+    async ({ clipId }) => {
+      try {
+        const found = getClipAudioBuffer(clipId, false);
+        if (!found) {
+          throw new Error(`Clip '${clipId}' not found.`);
+        }
+        const rec = found.record;
+        const base = publicBaseUrl.replace(/\/$/, "");
+        const audioUrl = `${base}/api/clips/${rec.id}.${found.ext}`;
+        const downloadUrl = `${audioUrl}?download=1`;
+        const fileName = `svara-${rec.id}.${found.ext}`;
+        const base64 = found.buffer.toString("base64");
+        const structuredPayload = {
+          clipId: rec.id,
+          audioUrl,
+          downloadUrl,
+          mimeType: found.mimeType,
+          format: found.ext,
+          sizeBytes: found.buffer.length,
+          sampleRate: rec.sampleRate,
+          channels: rec.channels,
+          script: rec.displayText,
+          voiceId: rec.voiceId,
+          voiceUsed: rec.voiceName,
+          modelUsed: rec.modelUsed,
+          durationMs: rec.durationMs,
+          durationSeconds: Number((rec.durationMs / 1e3).toFixed(2)),
+          timingSource: rec.timingSource || "forced_alignment",
+          timingConfidence: rec.timingConfidence ?? 0.85,
+          wordTimings: rec.wordTimings,
+          phraseTimings: rec.phraseTimings,
+          waveformPeaks: rec.waveformPeaks ?? [],
+          speechEnvelope: rec.speechEnvelope,
+          segments: rec.segments,
+          createdAt: rec.createdAt
+        };
+        const content = [
+          {
+            type: "resource_link",
+            uri: downloadUrl,
+            name: fileName,
+            title: `${rec.voiceName} (${found.ext.toUpperCase()})`,
+            mimeType: found.mimeType,
+            size: found.buffer.length
+          }
+        ];
+        if (base64.length <= 16e6) {
+          content.push({
+            type: "audio",
+            data: base64,
+            mimeType: found.mimeType
+          });
+        }
+        content.push({
+          type: "text",
+          text: `Loaded clip ${rec.id} (${(rec.durationMs / 1e3).toFixed(2)}s, ${rec.voiceName}, ${rec.modelUsed}). Download: ${downloadUrl}`
+        });
+        return {
+          content,
+          structuredContent: structuredPayload
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -2910,22 +3787,26 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const preset = VOICE_PRESETS.find((v) => v.id === (args.voiceId || "ethan")) ?? VOICE_PRESETS[0];
-      const res = await synthesizeSpeech({
-        mode: "single",
-        language: args.language,
-        modelTier: "standard",
-        text: args.text,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: args.stylePrompt ?? preset.defaultStyle,
-        speed: args.speed,
-        sampleRate: args.sampleRate,
-        channels: args.channels,
-        masteringPreset: args.masteringPreset,
-        segmentMode: true
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const preset = VOICE_PRESETS.find((v) => v.id === (args.voiceId || "ethan")) ?? VOICE_PRESETS[0];
+        const res = await synthesizeSpeech({
+          mode: "single",
+          language: args.language,
+          modelTier: "standard",
+          text: args.text,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: args.stylePrompt ?? preset.defaultStyle,
+          speed: args.speed,
+          sampleRate: args.sampleRate,
+          channels: args.channels,
+          masteringPreset: args.masteringPreset,
+          segmentMode: true
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -2944,15 +3825,19 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const res = await regenerateClipSegment(args);
-      return buildAudioToolResult(publicBaseUrl, res, { regeneratedSegmentIndex: args.segmentIndex });
+      try {
+        const res = await regenerateClipSegment(args);
+        return buildAudioToolResult(publicBaseUrl, res, { regeneratedSegmentIndex: args.segmentIndex });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
     "generate_subtitles",
     {
       title: "Generate Synchronized Subtitles (.SRT, .VTT, .ASS, JSON)",
-      description: "Generate time-aligned captions from a synthesized clipId. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).",
+      description: "Generate time-aligned captions from a synthesized clipId based on duration and line constraints. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).",
       inputSchema: {
         clipId: z.string(),
         format: z.enum(["srt", "vtt", "ass", "json"]).default("ass"),
@@ -2960,6 +3845,7 @@ function createSvaraMcpServer(publicBaseUrl) {
         maxLines: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional().default(3),
         maxCharsPerLine: z.number().int().min(10).max(80).optional(),
         maxPhraseDurationMs: z.number().int().min(800).max(1e4).optional(),
+        maxDurationSeconds: z.number().min(0.8).max(12).optional(),
         safeAreaMarginV: z.number().int().min(20).max(800).optional()
       }
     },
@@ -2970,69 +3856,66 @@ function createSvaraMcpServer(publicBaseUrl) {
       maxLines,
       maxCharsPerLine,
       maxPhraseDurationMs,
+      maxDurationSeconds,
       safeAreaMarginV
     }) => {
-      const record = getClipRecord(clipId);
-      if (!record) {
-        throw new Error(`Clip '${clipId}' not found.`);
-      }
-      const subtitleText = generateSubtitles({
-        wordTimings: record.wordTimings,
-        format,
-        preset,
-        maxLines,
-        maxCharsPerLine,
-        maxPhraseDurationMs,
-        safeAreaMarginV
-      });
-      const downloadUrl = `${publicBaseUrl.replace(/\/$/, "")}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
-      const mimeMap = {
-        srt: "application/x-subrip",
-        vtt: "text/vtt",
-        ass: "text/x-ssa",
-        json: "application/json"
-      };
-      return {
-        content: [
-          {
-            type: "resource_link",
-            uri: downloadUrl,
-            name: `svara-${clipId}.${format}`,
-            title: `Subtitles (${preset}, ${format.toUpperCase()})`,
-            mimeType: mimeMap[format]
-          },
-          {
-            type: "resource",
-            resource: {
-              uri: `svara://clips/${clipId}.${format}`,
-              mimeType: mimeMap[format],
-              text: subtitleText
-            }
-          },
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                clipId,
-                format,
-                preset,
-                downloadUrl,
-                cueCount: record.phraseTimings.length,
-                content: subtitleText
-              },
-              null,
-              2
-            )
-          }
-        ],
-        structuredContent: {
-          clipId,
+      try {
+        const record = getClipRecord(clipId);
+        if (!record) {
+          throw new Error(`Clip '${clipId}' not found.`);
+        }
+        const subtitleText = generateSubtitles({
+          wordTimings: record.wordTimings,
           format,
           preset,
-          downloadUrl,
-          content: subtitleText
-        }
-      };
+          maxLines,
+          maxCharsPerLine,
+          maxPhraseDurationMs,
+          maxDurationSeconds,
+          safeAreaMarginV
+        });
+        const downloadUrl = `${publicBaseUrl.replace(/\/$/, "")}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
+        const mimeMap = {
+          srt: "application/x-subrip",
+          vtt: "text/vtt",
+          ass: "text/x-ssa",
+          json: "application/json"
+        };
+        return {
+          content: [
+            {
+              type: "resource_link",
+              uri: downloadUrl,
+              name: `svara-${clipId}.${format}`,
+              title: `Subtitles (${preset}, ${format.toUpperCase()})`,
+              mimeType: mimeMap[format]
+            },
+            {
+              type: "resource",
+              resource: {
+                uri: `svara://clips/${clipId}.${format}`,
+                mimeType: mimeMap[format],
+                text: subtitleText
+              }
+            },
+            {
+              type: "text",
+              text: `Generated ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`
+            }
+          ],
+          structuredContent: {
+            clipId,
+            format,
+            preset,
+            maxLines,
+            timingSource: record.timingSource || "forced_alignment",
+            downloadUrl,
+            content: subtitleText
+          }
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3068,59 +3951,63 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const speakerList = args.speakers?.length ? args.speakers.map((s) => {
-        const p = VOICE_PRESETS.find((v) => v.id === s.voiceId) ?? VOICE_PRESETS[0];
-        return {
-          id: s.key,
-          name: s.name,
-          voiceId: p.id,
-          baseVoice: p.baseVoice,
-          style: s.style || p.defaultStyle
-        };
-      }) : [
-        (() => {
-          const p = VOICE_PRESETS.find((v) => v.id === (args.speakerAVoiceId || "vikram")) ?? VOICE_PRESETS[3];
+      try {
+        const speakerList = args.speakers?.length ? args.speakers.map((s) => {
+          const p = VOICE_PRESETS.find((v) => v.id === s.voiceId) ?? VOICE_PRESETS[0];
           return {
-            id: "A",
-            name: args.speakerAName || "Vikram",
+            id: s.key,
+            name: s.name,
             voiceId: p.id,
             baseVoice: p.baseVoice,
-            style: args.speakerAStyle || p.defaultStyle
+            style: s.style || p.defaultStyle
           };
-        })(),
-        (() => {
-          const p = VOICE_PRESETS.find((v) => v.id === (args.speakerBVoiceId || "ananya")) ?? VOICE_PRESETS[1];
-          return {
-            id: "B",
-            name: args.speakerBName || "Ananya",
-            voiceId: p.id,
-            baseVoice: p.baseVoice,
-            style: args.speakerBStyle || p.defaultStyle
-          };
-        })()
-      ];
-      const res = await synthesizeSpeech({
-        mode: "multi",
-        language: args.language,
-        modelTier: "standard",
-        text: "",
-        voiceName: speakerList[0].baseVoice,
-        stylePrompt: "",
-        speed: args.speed,
-        speakerList,
-        separateStems: args.separateStems,
-        dialogueLines: args.turns.map((t, i) => ({
-          id: `turn-${i + 1}`,
-          speakerKey: t.speaker,
-          text: t.text,
-          emotion: t.emotion
-        })),
-        sampleRate: 48e3,
-        channels: 1
-      });
-      return buildAudioToolResult(publicBaseUrl, res, {
-        speakers: speakerList.map((s) => s.name)
-      });
+        }) : [
+          (() => {
+            const p = VOICE_PRESETS.find((v) => v.id === (args.speakerAVoiceId || "vikram")) ?? VOICE_PRESETS[3];
+            return {
+              id: "A",
+              name: args.speakerAName || "Vikram",
+              voiceId: p.id,
+              baseVoice: p.baseVoice,
+              style: args.speakerAStyle || p.defaultStyle
+            };
+          })(),
+          (() => {
+            const p = VOICE_PRESETS.find((v) => v.id === (args.speakerBVoiceId || "ananya")) ?? VOICE_PRESETS[1];
+            return {
+              id: "B",
+              name: args.speakerBName || "Ananya",
+              voiceId: p.id,
+              baseVoice: p.baseVoice,
+              style: args.speakerBStyle || p.defaultStyle
+            };
+          })()
+        ];
+        const res = await synthesizeSpeech({
+          mode: "multi",
+          language: args.language,
+          modelTier: "standard",
+          text: "",
+          voiceName: speakerList[0].baseVoice,
+          stylePrompt: "",
+          speed: args.speed,
+          speakerList,
+          separateStems: args.separateStems,
+          dialogueLines: args.turns.map((t, i) => ({
+            id: `turn-${i + 1}`,
+            speakerKey: t.speaker,
+            text: t.text,
+            emotion: t.emotion
+          })),
+          sampleRate: 48e3,
+          channels: 1
+        });
+        return buildAudioToolResult(publicBaseUrl, res, {
+          speakers: speakerList.map((s) => s.name)
+        });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3135,11 +4022,15 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async ({ text, targetLanguage, preserveDuration }) => {
-      const translatedText = await translateSpeechScript(text, targetLanguage, preserveDuration);
-      return {
-        content: [{ type: "text", text: JSON.stringify({ targetLanguage, translatedText }, null, 2) }],
-        structuredContent: { targetLanguage, translatedText }
-      };
+      try {
+        const translatedText = await translateSpeechScript(text, targetLanguage, preserveDuration);
+        return {
+          content: [{ type: "text", text: translatedText }],
+          structuredContent: { targetLanguage, translatedText }
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3156,30 +4047,51 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const localized = await localizeNarration(args);
-      const base = publicBaseUrl.replace(/\/$/, "");
-      const summary = localized.map((item) => ({
-        language: item.language,
-        script: item.script,
-        clipId: item.result.clipId,
-        audioUrl: `${base}${item.result.audioUrl}`,
-        downloadUrl: `${base}${item.result.downloadUrl}`,
-        durationMs: item.result.durationMs,
-        wordTimings: item.result.wordTimings,
-        srt: item.srt
-      }));
-      return {
-        content: [
-          ...localized.map((item) => ({
+      try {
+        const localized = await localizeNarration(args);
+        const base = publicBaseUrl.replace(/\/$/, "");
+        const summary = localized.map((item) => ({
+          language: item.language,
+          script: item.script,
+          clipId: item.result.clipId,
+          audioUrl: `${base}${item.result.audioUrl}`,
+          downloadUrl: `${base}${item.result.downloadUrl}`,
+          modelUsed: item.result.modelUsed,
+          voiceUsed: item.result.voiceUsed || item.result.voiceName,
+          durationMs: item.result.durationMs,
+          timingSource: item.result.timingSource,
+          timingConfidence: item.result.timingConfidence,
+          wordTimings: item.result.wordTimings,
+          waveformPeaks: item.result.waveformPeaks,
+          srt: item.srt
+        }));
+        const content = [];
+        for (const item of localized) {
+          content.push({
             type: "resource_link",
             uri: `${base}${item.result.downloadUrl}`,
             name: `svara-${item.language}-${item.result.clipId}.wav`,
             mimeType: "audio/wav"
-          })),
-          { type: "text", text: JSON.stringify({ localizations: summary }, null, 2) }
-        ],
-        structuredContent: { localizations: summary }
-      };
+          });
+          if (item.result.audioBase64 && item.result.audioBase64.length <= 8e6) {
+            content.push({
+              type: "audio",
+              data: item.result.audioBase64,
+              mimeType: item.result.mimeType
+            });
+          }
+        }
+        content.push({
+          type: "text",
+          text: `Localized narration into ${localized.map((i) => `${i.language} (${i.result.clipId})`).join(", ")}.`
+        });
+        return {
+          content,
+          structuredContent: { localizations: summary }
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3198,7 +4110,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async (args) => {
       const entry = upsertPronunciation(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(entry, null, 2) }],
+        content: [{ type: "text", text: `Saved pronunciation rule for "${entry.term}" -> "${entry.phonetic}".` }],
         structuredContent: { entry }
       };
     }
@@ -3213,7 +4125,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async () => {
       const entries = listPronunciations();
       return {
-        content: [{ type: "text", text: JSON.stringify({ count: entries.length, entries }, null, 2) }],
+        content: [{ type: "text", text: `${entries.length} pronunciation rules configured.` }],
         structuredContent: { count: entries.length, entries }
       };
     }
@@ -3228,7 +4140,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async ({ idOrTerm }) => {
       const deleted = deletePronunciation(idOrTerm);
       return {
-        content: [{ type: "text", text: JSON.stringify({ deleted, idOrTerm }, null, 2) }],
+        content: [{ type: "text", text: deleted ? `Removed "${idOrTerm}".` : `No rule found for "${idOrTerm}".` }],
         structuredContent: { deleted, idOrTerm }
       };
     }
@@ -3256,7 +4168,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async (args) => {
       const preset = upsertVoicePreset(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(preset, null, 2) }],
+        content: [{ type: "text", text: `Saved voice preset "${preset.name}" (${preset.id}).` }],
         structuredContent: { preset }
       };
     }
@@ -3271,7 +4183,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async () => {
       const presets = listVoicePresets();
       return {
-        content: [{ type: "text", text: JSON.stringify({ count: presets.length, presets }, null, 2) }],
+        content: [{ type: "text", text: `${presets.length} saved voice presets available.` }],
         structuredContent: { count: presets.length, presets }
       };
     }
@@ -3286,7 +4198,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async ({ id }) => {
       const deleted = deleteVoicePreset(id);
       return {
-        content: [{ type: "text", text: JSON.stringify({ deleted, id }, null, 2) }],
+        content: [{ type: "text", text: deleted ? `Deleted preset ${id}.` : `Preset ${id} not found.` }],
         structuredContent: { deleted, id }
       };
     }
@@ -3305,7 +4217,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async (args) => {
       const project = createProject(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(project, null, 2) }],
+        content: [{ type: "text", text: `Created project "${project.name}" (${project.id}).` }],
         structuredContent: { project }
       };
     }
@@ -3320,7 +4232,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     async () => {
       const projects = listProjects();
       return {
-        content: [{ type: "text", text: JSON.stringify({ count: projects.length, projects }, null, 2) }],
+        content: [{ type: "text", text: `${projects.length} narration projects found.` }],
         structuredContent: { count: projects.length, projects }
       };
     }
@@ -3334,9 +4246,11 @@ function createSvaraMcpServer(publicBaseUrl) {
     },
     async ({ projectId }) => {
       const project = getProject(projectId);
-      if (!project) throw new Error(`Project '${projectId}' not found.`);
+      if (!project) {
+        return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify(project, null, 2) }],
+        content: [{ type: "text", text: `Project "${project.name}" (${project.clips.length} clips).` }],
         structuredContent: { project }
       };
     }
@@ -3354,7 +4268,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     },
     async ({ projectId, clipId, title }) => {
       const rec = getClipRecord(clipId);
-      if (!rec) throw new Error(`Clip '${clipId}' not found.`);
+      if (!rec) return handleMcpToolError(new Error(`Clip '${clipId}' not found.`));
       const updated = addClipToProject(projectId, {
         clipId: rec.id,
         title: title || rec.displayText.slice(0, 48),
@@ -3368,9 +4282,9 @@ function createSvaraMcpServer(publicBaseUrl) {
         audioUrl: `/api/clips/${rec.id}.${rec.format}`,
         downloadUrl: `/api/clips/${rec.id}.${rec.format}?download=1`
       });
-      if (!updated) throw new Error(`Project '${projectId}' not found.`);
+      if (!updated) return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
       return {
-        content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: "text", text: `Added clip ${clipId} to project "${updated.name}".` }],
         structuredContent: { project: updated }
       };
     }
@@ -3390,9 +4304,9 @@ function createSvaraMcpServer(publicBaseUrl) {
     },
     async ({ projectId, clipId, title, text, order }) => {
       const updated = updateProjectClip(projectId, clipId, { title, text, order });
-      if (!updated) throw new Error("Project or clip not found.");
+      if (!updated) return handleMcpToolError(new Error("Project or clip not found."));
       return {
-        content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: "text", text: `Updated clip ${clipId} in project "${updated.name}".` }],
         structuredContent: { project: updated }
       };
     }
@@ -3406,9 +4320,9 @@ function createSvaraMcpServer(publicBaseUrl) {
     },
     async ({ projectId, clipId }) => {
       const updated = deleteProjectClip(projectId, clipId);
-      if (!updated) throw new Error("Project not found.");
+      if (!updated) return handleMcpToolError(new Error("Project not found."));
       return {
-        content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: "text", text: `Removed clip ${clipId} from project "${updated.name}".` }],
         structuredContent: { project: updated }
       };
     }
@@ -3422,7 +4336,7 @@ function createSvaraMcpServer(publicBaseUrl) {
     },
     async ({ projectId }) => {
       const proj = getProject(projectId);
-      if (!proj) throw new Error(`Project '${projectId}' not found.`);
+      if (!proj) return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
       const base = publicBaseUrl.replace(/\/$/, "");
       const manifest = {
         ...proj,
@@ -3435,7 +4349,7 @@ function createSvaraMcpServer(publicBaseUrl) {
         }))
       };
       return {
-        content: [{ type: "text", text: JSON.stringify(manifest, null, 2) }],
+        content: [{ type: "text", text: `Exported project "${proj.name}" (${manifest.clips.length} clips).` }],
         structuredContent: manifest
       };
     }
@@ -3454,12 +4368,16 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const { buffer, mimeType } = await resolveInputAudioBuffer(args);
-      const transcript = await transcribeAudioBuffer(buffer, mimeType);
-      return {
-        content: [{ type: "text", text: JSON.stringify({ transcript }, null, 2) }],
-        structuredContent: { transcript }
-      };
+      try {
+        const { buffer, mimeType } = await resolveInputAudioBuffer(args);
+        const transcript = await transcribeAudioBuffer(buffer, mimeType);
+        return {
+          content: [{ type: "text", text: transcript }],
+          structuredContent: { transcript }
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3476,12 +4394,21 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const { buffer, mimeType } = await resolveInputAudioBuffer(args);
-      const analysis = await analyzeVoiceBuffer(buffer, mimeType);
-      return {
-        content: [{ type: "text", text: JSON.stringify(analysis, null, 2) }],
-        structuredContent: analysis
-      };
+      try {
+        const { buffer, mimeType } = await resolveInputAudioBuffer(args);
+        const analysis = await analyzeVoiceBuffer(buffer, mimeType);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${analysis.voiceDescription} \xB7 Recommended preset: ${analysis.recommendedVoiceId} (~${analysis.estimatedWpm} WPM).`
+            }
+          ],
+          structuredContent: analysis
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3501,19 +4428,23 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const { buffer, mimeType, sourceText } = await resolveInputAudioBuffer(args);
-      const transcript = sourceText || await transcribeAudioBuffer(buffer, mimeType);
-      const [localized] = await localizeNarration({
-        text: transcript,
-        targetLanguages: [args.targetLanguage],
-        voiceId: args.voiceId,
-        preserveDuration: args.preserveDuration
-      });
-      return buildAudioToolResult(publicBaseUrl, localized.result, {
-        sourceTranscript: transcript,
-        localizedScript: localized.script,
-        srt: localized.srt
-      });
+      try {
+        const { buffer, mimeType, sourceText } = await resolveInputAudioBuffer(args);
+        const transcript = sourceText || await transcribeAudioBuffer(buffer, mimeType);
+        const [localized] = await localizeNarration({
+          text: transcript,
+          targetLanguages: [args.targetLanguage],
+          voiceId: args.voiceId,
+          preserveDuration: args.preserveDuration
+        });
+        return buildAudioToolResult(publicBaseUrl, localized.result, {
+          sourceTranscript: transcript,
+          localizedScript: localized.script,
+          srt: localized.srt
+        });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3533,15 +4464,19 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const { buffer, sourceText } = await resolveInputAudioBuffer(args);
-      const res = await matchAudioDuration({
-        buffer,
-        targetDurationSeconds: args.targetDurationSeconds,
-        sampleRate: args.sampleRate,
-        channels: args.channels,
-        sourceText
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const { buffer, sourceText } = await resolveInputAudioBuffer(args);
+        const res = await matchAudioDuration({
+          buffer,
+          targetDurationSeconds: args.targetDurationSeconds,
+          sampleRate: args.sampleRate,
+          channels: args.channels,
+          sourceText
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   server.registerTool(
@@ -3563,16 +4498,20 @@ function createSvaraMcpServer(publicBaseUrl) {
       }
     },
     async (args) => {
-      const { buffer } = await resolveInputAudioBuffer(args);
-      const res = await replaceAudioSegmentFromBuffer({
-        buffer,
-        startMs: args.startMs,
-        endMs: args.endMs,
-        replacementText: args.replacementText,
-        voiceId: args.voiceId,
-        language: args.language
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const { buffer } = await resolveInputAudioBuffer(args);
+        const res = await replaceAudioSegmentFromBuffer({
+          buffer,
+          startMs: args.startMs,
+          endMs: args.endMs,
+          replacementText: args.replacementText,
+          voiceId: args.voiceId,
+          language: args.language
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
   return server;
@@ -3611,11 +4550,21 @@ async function startServer() {
   app.use(express.json({ limit: "16mb" }));
   const sseSessions = /* @__PURE__ */ new Map();
   app.get("/api/health", (req, res) => {
+    const base = resolvePublicBaseUrl(req);
     res.json({
       ok: true,
+      version: SVARA_MCP_VERSION,
+      build: SVARA_MCP_BUILD,
+      mcpToolsCount: 28,
+      storageDir: getStoreDir(),
       hasKey: Boolean(process.env.GEMINI_API_KEY),
-      mcpEndpoint: `${resolvePublicBaseUrl(req)}/mcp`,
-      sseEndpoint: `${resolvePublicBaseUrl(req)}/sse`
+      providers: {
+        gemini: Boolean(process.env.GEMINI_API_KEY),
+        openai: Boolean(process.env.OPENAI_API_KEY?.trim()),
+        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY?.trim())
+      },
+      mcpEndpoint: `${base}/mcp`,
+      sseEndpoint: `${base}/sse`
     });
   });
   app.get("/api/clips/:id.:ext", mcpCorsMiddleware, (req, res) => {
@@ -3691,6 +4640,42 @@ async function startServer() {
   app.get("/api/clips", (_req, res) => {
     res.json({ clips: listRecentClips(30) });
   });
+  app.get("/api/clips/:id", mcpCorsMiddleware, (req, res) => {
+    const id = String(req.params.id);
+    const record = getClipRecord(id);
+    if (!record) {
+      res.status(404).json({
+        error_code: "INVALID_ARGUMENT",
+        error: `Clip '${id}' not found.`,
+        message: `Clip '${id}' not found.`
+      });
+      return;
+    }
+    const base = resolvePublicBaseUrl(req);
+    const audioPath = `/api/clips/${record.id}.${record.format}`;
+    res.json({
+      clipId: record.id,
+      audioUrl: `${base}${audioPath}`,
+      downloadUrl: `${base}${audioPath}?download=1`,
+      mimeType: record.mimeType,
+      format: record.format,
+      sampleRate: record.sampleRate,
+      channels: record.channels,
+      sizeBytes: record.sizeBytes,
+      script: record.displayText,
+      voiceId: record.voiceId,
+      voiceUsed: record.voiceName,
+      modelUsed: record.modelUsed,
+      durationMs: record.durationMs,
+      timingSource: record.timingSource || "forced_alignment",
+      timingConfidence: record.timingConfidence ?? 0.85,
+      wordTimings: record.wordTimings,
+      phraseTimings: record.phraseTimings,
+      waveformPeaks: record.waveformPeaks ?? [],
+      segments: record.segments,
+      createdAt: record.createdAt
+    });
+  });
   app.post("/api/tts/generate", async (req, res) => {
     try {
       const payload = req.body;
@@ -3698,7 +4683,7 @@ async function startServer() {
       res.json(result);
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
   app.post("/api/tts/segments/regenerate", async (req, res) => {
@@ -3708,7 +4693,7 @@ async function startServer() {
       res.json(result);
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
   app.post("/api/script/translate", async (req, res) => {
@@ -3722,7 +4707,7 @@ async function startServer() {
       res.json({ translatedText });
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
   app.get("/api/pronunciations", (_req, res) => {

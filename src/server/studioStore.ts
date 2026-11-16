@@ -13,13 +13,31 @@ import type {
   SpeechSegmentMeta,
   StudioProject,
   StudioProjectClip,
+  TimingSource,
   WordTiming,
 } from '../types';
 
-const STORE_DIR = '/tmp/svara-studio';
+function resolveStoreDir(): string {
+  if (process.env.SVARA_DATA_DIR?.trim()) {
+    return path.resolve(process.env.SVARA_DATA_DIR.trim());
+  }
+  const preferred = path.resolve(process.cwd(), '.svara-data');
+  try {
+    fs.mkdirSync(preferred, { recursive: true });
+    return preferred;
+  } catch {
+    return '/tmp/svara-studio';
+  }
+}
+
+const STORE_DIR = resolveStoreDir();
 const CLIPS_DIR = path.join(STORE_DIR, 'clips');
 const STATE_FILE = path.join(STORE_DIR, 'state.json');
-const MAX_CLIPS = 120;
+const MAX_CLIPS = 500;
+
+export function getStoreDir(): string {
+  return STORE_DIR;
+}
 
 export interface StoredClipRecord {
   id: string;
@@ -36,10 +54,15 @@ export interface StoredClipRecord {
   modelUsed: string;
   language: 'en' | 'hi' | 'bilingual';
   displayText: string;
+  stylePrompt?: string;
+  speed?: number;
   masteringPreset: MasteringPreset;
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   wordTimings: WordTiming[];
   phraseTimings: PhraseTiming[];
   speechEnvelope: SpeechEnvelopeInterval[];
+  waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];
   createdAt: string;
 }
@@ -315,10 +338,15 @@ export function saveStoredClip(params: {
   modelUsed: string;
   language: 'en' | 'hi' | 'bilingual';
   displayText: string;
+  stylePrompt?: string;
+  speed?: number;
   masteringPreset: MasteringPreset;
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   wordTimings: WordTiming[];
   phraseTimings: PhraseTiming[];
   speechEnvelope: SpeechEnvelopeInterval[];
+  waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];
 }): StoredClipRecord {
   ensureDirs();
@@ -349,10 +377,15 @@ export function saveStoredClip(params: {
     modelUsed: params.modelUsed,
     language: params.language,
     displayText: params.displayText,
+    stylePrompt: params.stylePrompt,
+    speed: params.speed,
     masteringPreset: params.masteringPreset,
+    timingSource: params.timingSource,
+    timingConfidence: params.timingConfidence,
     wordTimings: params.wordTimings,
     phraseTimings: params.phraseTimings,
     speechEnvelope: params.speechEnvelope,
+    waveformPeaks: params.waveformPeaks,
     segments: params.segments,
     createdAt: new Date().toISOString(),
   };
@@ -373,7 +406,21 @@ export function saveStoredClip(params: {
 }
 
 export function getClipRecord(id: string): StoredClipRecord | undefined {
-  return stateCache.clips.find((c) => c.id === id);
+  const cached = stateCache.clips.find((c) => c.id === id);
+  if (cached) return cached;
+  // Refresh from disk in case another process/restart wrote state.json
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as Partial<PersistedState>;
+      if (Array.isArray(parsed.clips)) {
+        stateCache.clips = parsed.clips;
+        return stateCache.clips.find((c) => c.id === id);
+      }
+    }
+  } catch {
+    // Ignore read error
+  }
+  return undefined;
 }
 
 export function getClipAudioBuffer(

@@ -244,6 +244,107 @@ export function buildStyleInstruction(params: {
   return parts.join('. ');
 }
 
+export interface ScriptChunkPlan {
+  text: string;
+  breakAfterMs: number;
+  emotion?: string;
+}
+
+export function splitLongScriptIntoChunkPlans(
+  text: string,
+  maxChunkChars = 3500
+): ScriptChunkPlan[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+
+  const paragraphs = trimmed
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const plans: ScriptChunkPlan[] = [];
+  let activeEmotion: string | undefined;
+
+  for (let pIdx = 0; pIdx < paragraphs.length; pIdx += 1) {
+    let para = paragraphs[pIdx];
+    const emotionMatch = para.match(/^\[([A-Z_]{2,24})\]\s*/);
+    if (emotionMatch) {
+      activeEmotion = emotionMatch[1];
+    } else if (activeEmotion && pIdx > 0 && !/^\[([A-Z_]{2,24})\]/.test(para)) {
+      // Carry forward paragraph-level emotion cue unless cleared
+    }
+
+    const isLastPara = pIdx === paragraphs.length - 1;
+    const paraBreakMs = isLastPara ? 0 : 220;
+
+    if (para.length <= maxChunkChars) {
+      // Merge short consecutive paragraphs ONLY when they share the same boundary and fit comfortably
+      const prev = plans[plans.length - 1];
+      if (
+        prev &&
+        !emotionMatch &&
+        prev.text.length + 1 + para.length <= maxChunkChars &&
+        plans.length === pIdx // keep single-chunk fast path for short scripts <= maxChunkChars
+      ) {
+        prev.text = `${prev.text}\n${para}`;
+        prev.breakAfterMs = paraBreakMs;
+      } else {
+        plans.push({ text: para, breakAfterMs: paraBreakMs, emotion: activeEmotion });
+      }
+      continue;
+    }
+
+    // Long paragraph: split at sentence boundaries while carrying active emotion tag cleanly
+    const sentences = para
+      .split(/(?<=[.!?।])\s+/u)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let current = '';
+    for (let sIdx = 0; sIdx < sentences.length; sIdx += 1) {
+      const sentence = sentences[sIdx];
+      const sentEmotion = sentence.match(/^\[([A-Z_]{2,24})\]\s*/);
+      if (sentEmotion) activeEmotion = sentEmotion[1];
+
+      if (sentence.length > maxChunkChars) {
+        if (current) {
+          plans.push({ text: current, breakAfterMs: 130, emotion: activeEmotion });
+          current = '';
+        }
+        for (let i = 0; i < sentence.length; i += maxChunkChars) {
+          const slice = sentence.slice(i, i + maxChunkChars).trim();
+          if (slice) {
+            plans.push({
+              text: slice,
+              breakAfterMs: i + maxChunkChars >= sentence.length && sIdx === sentences.length - 1 ? paraBreakMs : 120,
+              emotion: activeEmotion,
+            });
+          }
+        }
+        continue;
+      }
+
+      const candidate = current ? `${current} ${sentence}` : sentence;
+      if (candidate.length <= maxChunkChars) {
+        current = candidate;
+      } else {
+        if (current) {
+          plans.push({ text: current, breakAfterMs: 130, emotion: activeEmotion });
+        }
+        current =
+          activeEmotion && !/^\[([A-Z_]{2,24})\]/.test(sentence)
+            ? `[${activeEmotion}] ${sentence}`
+            : sentence;
+      }
+    }
+    if (current) {
+      plans.push({ text: current, breakAfterMs: paraBreakMs, emotion: activeEmotion });
+    }
+  }
+
+  return plans;
+}
+
 export function splitLongScriptIntoChunks(
   text: string,
   maxChunkChars = 3500
@@ -251,59 +352,7 @@ export function splitLongScriptIntoChunks(
   const trimmed = text.trim();
   if (!trimmed) return [];
   if (trimmed.length <= maxChunkChars) return [trimmed];
-
-  const paragraphs = trimmed
-    .split(/\n+/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  const chunks: string[] = [];
-  let current = '';
-
-  const pushSentencewise = (block: string) => {
-    const sentences = block
-      .split(/(?<=[.!?।])\s+/u)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    for (const sentence of sentences) {
-      if (sentence.length > maxChunkChars) {
-        for (let i = 0; i < sentence.length; i += maxChunkChars) {
-          const slice = sentence.slice(i, i + maxChunkChars).trim();
-          if (slice) {
-            if (current) {
-              chunks.push(current);
-              current = '';
-            }
-            chunks.push(slice);
-          }
-        }
-        continue;
-      }
-      const next = current ? `${current} ${sentence}` : sentence;
-      if (next.length <= maxChunkChars) {
-        current = next;
-      } else {
-        if (current) chunks.push(current);
-        current = sentence;
-      }
-    }
-  };
-
-  for (const para of paragraphs) {
-    const candidate = current ? `${current}\n${para}` : para;
-    if (candidate.length <= maxChunkChars) {
-      current = candidate;
-    } else if (para.length <= maxChunkChars) {
-      if (current) chunks.push(current);
-      current = para;
-    } else {
-      pushSentencewise(para);
-    }
-  }
-  if (current) {
-    chunks.push(current);
-  }
-  return chunks;
+  return splitLongScriptIntoChunkPlans(trimmed, maxChunkChars).map((p) => p.text);
 }
 
 export function validateGeneratePayload(

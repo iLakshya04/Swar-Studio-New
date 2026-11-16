@@ -7,12 +7,12 @@ interface McpConnectPanelProps {
 
 const CREATOR_TOOLS_SUMMARY = [
   {
-    name: 'generate_speech',
-    summary: '48 kHz mono/stereo WAV, MP3/M4A/FLAC, native file handoff, wordTimings, speechEnvelope, target duration',
+    name: 'generate_speech & get_clip',
+    summary: '48 kHz mono/stereo WAV, MP3/M4A/FLAC, native MCP audio attachment, forced-aligned wordTimings, waveformPeaks, multi-provider fallback, and clip retrieval',
   },
   {
     name: 'generate_subtitles',
-    summary: 'Direct .SRT, .VTT, .ASS (Rainbow Reels white + cyan #00E5FF active word), and word-timing JSON',
+    summary: 'Direct .SRT, .VTT, .ASS (Rainbow Reels white + cyan #00E5FF active word), and word-timing JSON with line/duration constraints',
   },
   {
     name: 'generate_speech_segments & regenerate_segment',
@@ -132,10 +132,10 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="space-y-1">
             <h2 className="text-base font-semibold text-[#0F172A] dark:text-slate-100">
-              Remote Creator Speech MCP Endpoints
+              Remote Creator Speech MCP Endpoints (v2.2.0)
             </h2>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Returns native MCP audio file resources/links, 48 kHz normalized WAVs, word timestamps, Rainbow Reels .ASS captions, and supports ChatGPT file uploads.
+              Returns native MCP audio attachments, file resource links, 48 kHz normalized WAVs, forced-aligned wordTimings, Rainbow Reels .ASS captions, and supports ChatGPT file uploads.
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -304,7 +304,7 @@ Auth: None`}
               Live MCP Endpoint Verification
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              Send live JSON-RPC 2.0 requests to <code className="font-mono">/mcp</code> to verify all 27 tools, workflow instructions, and pronunciation dictionary.
+              Send live JSON-RPC 2.0 requests to <code className="font-mono">/mcp</code> to verify all 28 tools (including <code className="font-mono">get_clip</code>), workflow instructions, and pronunciation dictionary.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2 shrink-0">

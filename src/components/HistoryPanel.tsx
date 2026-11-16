@@ -1,12 +1,15 @@
 import { useState } from 'react';
 import { Captions, Download, Mic2, Play, RotateCcw, Search, Trash2 } from 'lucide-react';
+import type { AudioPlaybackController } from '../hooks/useAudioPlayback';
 import type { HistoryItem, SubtitleFormat } from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
-import { generateSubtitles } from '../utils/subtitleGenerator';
+import { generate_subtitles } from '../utils/subtitleGenerator';
+import { InteractiveWaveform } from './InteractiveWaveform';
 
 interface HistoryPanelProps {
   items: HistoryItem[];
   activeTrackId: string | null;
+  playback: AudioPlaybackController;
   onPlayItem: (item: HistoryItem) => void;
   onRestoreToStudio: (item: HistoryItem) => void;
   onDeleteItem: (id: string) => void;
@@ -17,6 +20,7 @@ interface HistoryPanelProps {
 export function HistoryPanel({
   items,
   activeTrackId,
+  playback,
   onPlayItem,
   onRestoreToStudio,
   onDeleteItem,
@@ -24,6 +28,8 @@ export function HistoryPanel({
   onGoToStudio,
 }: HistoryPanelProps) {
   const [searchQuery, setSearchQuery] = useState('');
+  const [maxLines, setMaxLines] = useState<1 | 2 | 3>(2);
+  const [maxDurationSec, setMaxDurationSec] = useState<number>(2.6);
 
   const filtered = items.filter((item) => {
     const q = searchQuery.trim().toLowerCase();
@@ -34,6 +40,13 @@ export function HistoryPanel({
       item.language.toLowerCase().includes(q)
     );
   });
+
+  const inspectedItem =
+    items.find((i) => i.id === activeTrackId) ??
+    filtered.find((i) => (i.wordTimings?.length ?? 0) > 0 || (i.waveformPeaks?.length ?? 0) > 0) ??
+    null;
+
+  const isInspectedActive = Boolean(inspectedItem && inspectedItem.id === activeTrackId);
 
   const handleDownloadWav = (item: HistoryItem) => {
     const safeName =
@@ -70,10 +83,13 @@ export function HistoryPanel({
 
   const handleDownloadSubtitles = (item: HistoryItem, format: SubtitleFormat) => {
     if (!item.wordTimings?.length) return;
-    const subText = generateSubtitles({
+    const subText = generate_subtitles({
       wordTimings: item.wordTimings,
       format,
-      preset: 'rainbow_reels',
+      preset: format === 'ass' ? 'rainbow_reels' : 'clean_editorial',
+      maxLines,
+      maxDurationSeconds: maxDurationSec,
+      maxPhraseDurationMs: Math.round(maxDurationSec * 1000),
     });
     const blob = new Blob([subText], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -97,7 +113,7 @@ export function HistoryPanel({
             No generated clips yet
           </h2>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            Generate speech in English, Hindi, or multi-speaker dialogue to save playable WAV clips and captions here.
+            Generate speech in English, Hindi, or multi-speaker dialogue to save playable WAV clips, interactive waveforms, and .SRT / .VTT / .ASS captions here.
           </p>
         </div>
         <button
@@ -113,7 +129,7 @@ export function HistoryPanel({
 
   return (
     <div className="space-y-4">
-      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
         <div className="relative flex-1 max-w-md">
           <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <label htmlFor="history-search-input" className="sr-only">
@@ -129,8 +145,46 @@ export function HistoryPanel({
           />
         </div>
 
-        <div className="flex items-center justify-between sm:justify-end gap-3">
-          <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+        <div className="flex flex-wrap items-center justify-between lg:justify-end gap-2.5">
+          <div className="flex items-center gap-2">
+            <label
+              htmlFor="history-subtitle-lines"
+              className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap"
+            >
+              Subtitle Lines
+            </label>
+            <select
+              id="history-subtitle-lines"
+              value={maxLines}
+              onChange={(e) => setMaxLines(Number(e.target.value) as 1 | 2 | 3)}
+              className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs text-[#0F172A] dark:text-slate-100 focus:outline-none focus:border-[#2563EB]"
+            >
+              <option value={1}>1 Line</option>
+              <option value={2}>2 Lines</option>
+              <option value={3}>3 Lines</option>
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <label
+              htmlFor="history-subtitle-duration"
+              className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap"
+            >
+              Max Cue
+            </label>
+            <select
+              id="history-subtitle-duration"
+              value={maxDurationSec}
+              onChange={(e) => setMaxDurationSec(Number(e.target.value))}
+              className="h-9 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-xs font-mono tabular-nums text-[#0F172A] dark:text-slate-100 focus:outline-none focus:border-[#2563EB]"
+            >
+              <option value={2}>2.0s</option>
+              <option value={2.6}>2.6s (Reels)</option>
+              <option value={4}>4.0s (Editorial)</option>
+            </select>
+          </div>
+
+          <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums px-1">
             {filtered.length} {filtered.length === 1 ? 'clip' : 'clips'}
           </span>
           <button
@@ -142,6 +196,44 @@ export function HistoryPanel({
           </button>
         </div>
       </div>
+
+      {/* Synchronized Interactive Waveform for Active / Selected History Clip */}
+      {inspectedItem &&
+        ((inspectedItem.wordTimings?.length ?? 0) > 0 ||
+          (inspectedItem.waveformPeaks?.length ?? 0) > 0) && (
+          <div data-testid="history-waveform-inspector">
+            <InteractiveWaveform
+              title={inspectedItem.textPreview}
+              wordTimings={inspectedItem.wordTimings ?? []}
+              waveformPeaks={inspectedItem.waveformPeaks}
+              timingSource={inspectedItem.timingSource}
+              timingConfidence={inspectedItem.timingConfidence}
+              durationSec={
+                isInspectedActive && playback.duration > 0
+                  ? playback.duration
+                  : inspectedItem.durationMs
+                    ? inspectedItem.durationMs / 1000
+                    : inspectedItem.durationSec
+              }
+              currentTime={isInspectedActive ? playback.currentTime : 0}
+              isPlaying={isInspectedActive ? playback.isPlaying : false}
+              hasAudio={Boolean(inspectedItem.audioBase64 || inspectedItem.clipId)}
+              onTogglePlay={() => {
+                if (isInspectedActive && playback.audioSrc) {
+                  playback.togglePlay();
+                } else {
+                  onPlayItem(inspectedItem);
+                }
+              }}
+              onSeek={(sec, autoPlay) => {
+                if (!isInspectedActive) {
+                  onPlayItem(inspectedItem);
+                }
+                playback.seekTo(sec, autoPlay);
+              }}
+            />
+          </div>
+        )}
 
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-200 dark:divide-slate-800">
         {filtered.map((item) => {
@@ -158,6 +250,7 @@ export function HistoryPanel({
           return (
             <div
               key={item.id}
+              data-testid="history-clip-row"
               className={`p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 transition-colors ${
                 isActive
                   ? 'bg-blue-50/40 dark:bg-blue-950/30'
@@ -188,7 +281,9 @@ export function HistoryPanel({
                       : item.language === 'bilingual'
                         ? 'Bilingual'
                         : 'English'}{' '}
-                    · {rateLabel} {channelLabel} WAV · {formatAudioTime(item.durationSec)} · {dateLabel}
+                    · {rateLabel} {channelLabel} WAV · {formatAudioTime(item.durationSec)} ·{' '}
+                    {item.wordTimings?.length ? `${item.wordTimings.length} words · ` : ''}
+                    {dateLabel}
                   </p>
                 </div>
               </div>
@@ -216,8 +311,16 @@ export function HistoryPanel({
                     </button>
                     <button
                       type="button"
+                      onClick={() => handleDownloadSubtitles(item, 'vtt')}
+                      aria-label={`Download VTT subtitles for ${item.textPreview}`}
+                      className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
+                    >
+                      <span>.VTT</span>
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => handleDownloadSubtitles(item, 'ass')}
-                      aria-label={`Download Rainbow Reels ASS captions for ${item.textPreview}`}
+                      aria-label={`Download ASS captions for ${item.textPreview}`}
                       className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
                     >
                       <span>.ASS</span>

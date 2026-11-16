@@ -5,7 +5,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createSvaraMcpServer } from './src/mcp/createSvaraMcpServer';
+import {
+  SVARA_MCP_BUILD,
+  SVARA_MCP_VERSION,
+  createSvaraMcpServer,
+} from './src/mcp/createSvaraMcpServer';
 import {
   createProject,
   deletePronunciation,
@@ -13,6 +17,7 @@ import {
   getClipAudioBuffer,
   getClipRecord,
   getProject,
+  getStoreDir,
   listProjects,
   listPronunciations,
   listRecentClips,
@@ -67,11 +72,21 @@ async function startServer() {
   const sseSessions = new Map<string, SSEServerTransport>();
 
   app.get('/api/health', (req: Request, res: Response) => {
+    const base = resolvePublicBaseUrl(req);
     res.json({
       ok: true,
+      version: SVARA_MCP_VERSION,
+      build: SVARA_MCP_BUILD,
+      mcpToolsCount: 28,
+      storageDir: getStoreDir(),
       hasKey: Boolean(process.env.GEMINI_API_KEY),
-      mcpEndpoint: `${resolvePublicBaseUrl(req)}/mcp`,
-      sseEndpoint: `${resolvePublicBaseUrl(req)}/sse`,
+      providers: {
+        gemini: Boolean(process.env.GEMINI_API_KEY),
+        openai: Boolean(process.env.OPENAI_API_KEY?.trim()),
+        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY?.trim()),
+      },
+      mcpEndpoint: `${base}/mcp`,
+      sseEndpoint: `${base}/sse`,
     });
   });
 
@@ -162,6 +177,43 @@ async function startServer() {
     res.json({ clips: listRecentClips(30) });
   });
 
+  app.get('/api/clips/:id', mcpCorsMiddleware, (req: Request, res: Response) => {
+    const id = String(req.params.id);
+    const record = getClipRecord(id);
+    if (!record) {
+      res.status(404).json({
+        error_code: 'INVALID_ARGUMENT',
+        error: `Clip '${id}' not found.`,
+        message: `Clip '${id}' not found.`,
+      });
+      return;
+    }
+    const base = resolvePublicBaseUrl(req);
+    const audioPath = `/api/clips/${record.id}.${record.format}`;
+    res.json({
+      clipId: record.id,
+      audioUrl: `${base}${audioPath}`,
+      downloadUrl: `${base}${audioPath}?download=1`,
+      mimeType: record.mimeType,
+      format: record.format,
+      sampleRate: record.sampleRate,
+      channels: record.channels,
+      sizeBytes: record.sizeBytes,
+      script: record.displayText,
+      voiceId: record.voiceId,
+      voiceUsed: record.voiceName,
+      modelUsed: record.modelUsed,
+      durationMs: record.durationMs,
+      timingSource: record.timingSource || 'forced_alignment',
+      timingConfidence: record.timingConfidence ?? 0.85,
+      wordTimings: record.wordTimings,
+      phraseTimings: record.phraseTimings,
+      waveformPeaks: record.waveformPeaks ?? [],
+      segments: record.segments,
+      createdAt: record.createdAt,
+    });
+  });
+
   app.post('/api/tts/generate', async (req: Request, res: Response) => {
     try {
       const payload = req.body as Partial<GenerateRequestPayload>;
@@ -169,7 +221,7 @@ async function startServer() {
       res.json(result);
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
 
@@ -188,7 +240,7 @@ async function startServer() {
       res.json(result);
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
 
@@ -207,7 +259,7 @@ async function startServer() {
       res.json({ translatedText });
     } catch (error) {
       const mapped = mapApiError(error);
-      res.status(mapped.status).json({ error: mapped.message });
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
     }
   });
 

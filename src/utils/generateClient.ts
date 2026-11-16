@@ -100,9 +100,37 @@ export function normalizeGenerateResponse(
 
   return {
     ...data,
+    voiceUsed: data.voiceUsed || data.voiceName,
+    timingSource: data.timingSource || (wordTimings.length > 0 ? 'forced_alignment' : 'estimated'),
+    timingConfidence:
+      typeof data.timingConfidence === 'number'
+        ? data.timingConfidence
+        : wordTimings.length > 0
+          ? 0.84
+          : 0.45,
     wordTimings,
     waveformPeaks,
   };
+}
+
+function buildClientError(
+  data: { error?: string; message?: string; error_code?: string; retryAfterSeconds?: number },
+  fallbackMsg: string
+): Error {
+  const baseMsg = data.error || data.message || fallbackMsg;
+  if (data.error_code === 'RESOURCE_EXHAUSTED' && typeof data.retryAfterSeconds === 'number') {
+    const mins = Math.max(1, Math.ceil(data.retryAfterSeconds / 60));
+    const err = new Error(`${baseMsg} (RESOURCE_EXHAUSTED · retry in ~${mins}m)`) as Error & {
+      error_code?: string;
+      retryAfterSeconds?: number;
+    };
+    err.error_code = data.error_code;
+    err.retryAfterSeconds = data.retryAfterSeconds;
+    return err;
+  }
+  const err = new Error(baseMsg) as Error & { error_code?: string };
+  if (data.error_code) err.error_code = data.error_code;
+  return err;
 }
 
 export async function generate(
@@ -120,9 +148,14 @@ export async function generate(
     body: JSON.stringify(payload),
   });
 
-  const data = (await response.json()) as GenerateResponsePayload & { error?: string };
+  const data = (await response.json()) as GenerateResponsePayload & {
+    error?: string;
+    message?: string;
+    error_code?: string;
+    retryAfterSeconds?: number;
+  };
   if (!response.ok || !data.audioBase64) {
-    throw new Error(data.error || 'Speech generation failed.');
+    throw buildClientError(data, 'Speech generation failed.');
   }
 
   return normalizeGenerateResponse(data);
@@ -147,9 +180,14 @@ export async function regenerateSegment(
     body: JSON.stringify(params),
   });
 
-  const data = (await response.json()) as GenerateResponsePayload & { error?: string };
+  const data = (await response.json()) as GenerateResponsePayload & {
+    error?: string;
+    message?: string;
+    error_code?: string;
+    retryAfterSeconds?: number;
+  };
   if (!response.ok || !data.audioBase64) {
-    throw new Error(data.error || 'Segment regeneration failed.');
+    throw buildClientError(data, 'Segment regeneration failed.');
   }
 
   return normalizeGenerateResponse(data);

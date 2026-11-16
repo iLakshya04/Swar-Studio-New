@@ -10,9 +10,15 @@ import {
   VolumeX,
 } from 'lucide-react';
 import type { AudioPlaybackController } from '../hooks/useAudioPlayback';
-import type { ChannelCount, SampleRateHz, SubtitleFormat, WordTiming } from '../types';
+import type {
+  ChannelCount,
+  SampleRateHz,
+  SubtitleFormat,
+  TimingSource,
+  WordTiming,
+} from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
-import { generateSubtitles } from '../utils/subtitleGenerator';
+import { generate_subtitles } from '../utils/subtitleGenerator';
 
 export interface ActiveTrack {
   id: string;
@@ -25,6 +31,8 @@ export interface ActiveTrack {
   durationSec: number;
   sampleRate?: SampleRateHz;
   channels?: ChannelCount;
+  timingSource?: TimingSource;
+  timingConfidence?: number;
   wordTimings?: WordTiming[];
   waveformPeaks?: number[];
 }
@@ -63,6 +71,12 @@ export function AudioPlayerBar({
     audioHandlers,
   } = playback;
 
+  const activeWord = track?.wordTimings?.find(
+    (w) =>
+      currentTime >= w.startSeconds - (isPlaying ? 0.03 : 0) &&
+      currentTime <= w.endSeconds + (isPlaying ? 0.05 : 0)
+  );
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -71,17 +85,26 @@ export function AudioPlayerBar({
 
     const barCount = 44;
     const realPeaks = track?.waveformPeaks;
+    const effectiveDur =
+      duration > 0
+        ? duration
+        : track?.durationSec && track.durationSec > 0
+          ? track.durationSec
+          : 1;
 
     const draw = (timeMs: number) => {
       const width = canvas.width;
       const height = canvas.height;
       ctx.clearRect(0, 0, width, height);
 
-      const progress = duration > 0 ? Math.min(1, currentTime / duration) : 0;
+      const progress = effectiveDur > 0 ? Math.min(1, currentTime / effectiveDur) : 0;
       const barWidth = Math.max(2, Math.floor((width - (barCount - 1) * 2) / barCount));
 
+      const wordStartRatio = activeWord ? activeWord.startSeconds / effectiveDur : -1;
+      const wordEndRatio = activeWord ? activeWord.endSeconds / effectiveDur : -1;
+
       for (let i = 0; i < barCount; i += 1) {
-        const ratio = i / barCount;
+        const ratio = (i + 0.5) / barCount;
         let baseEnvelope: number;
         if (realPeaks && realPeaks.length > 0) {
           const peakIdx = Math.min(
@@ -102,8 +125,13 @@ export function AudioPlayerBar({
         const x = i * (barWidth + 2);
         const y = Math.round((height - barH) / 2);
 
+        const inActiveWord =
+          activeWord && ratio >= wordStartRatio && ratio <= wordEndRatio;
+
         if (!track) {
           ctx.fillStyle = isDark ? '#1E293B' : '#E2E8F0';
+        } else if (inActiveWord) {
+          ctx.fillStyle = '#0EA5E9';
         } else if (ratio <= progress) {
           ctx.fillStyle = '#2563EB';
         } else {
@@ -123,7 +151,7 @@ export function AudioPlayerBar({
         cancelAnimationFrame(rafRef.current);
       }
     };
-  }, [isPlaying, currentTime, duration, track, isDark]);
+  }, [isPlaying, currentTime, duration, track, isDark, activeWord]);
 
   const handleDownloadWav = () => {
     if (!track) return;
@@ -149,7 +177,7 @@ export function AudioPlayerBar({
     const safeName =
       track.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32) ||
       'svara-captions';
-    const subContent = generateSubtitles({
+    const subContent = generate_subtitles({
       wordTimings: track.wordTimings,
       format,
       preset: 'rainbow_reels',
@@ -218,9 +246,15 @@ export function AudioPlayerBar({
             <p className="text-xs text-slate-500 dark:text-slate-400 truncate hidden sm:block">
               {isGenerating
                 ? 'Generating mastered studio WAV'
-                : track
-                  ? `${track.subtitle} · ${formatMeta}`
-                  : 'Write or load a script and press Generate Speech'}
+                : activeWord
+                  ? (
+                    <span data-testid="player-active-word" className="text-[#0EA5E9] dark:text-cyan-400 font-medium">
+                      Speaking: “{activeWord.word}” · {formatMeta}
+                    </span>
+                  )
+                  : track
+                    ? `${track.subtitle} · ${formatMeta}`
+                    : 'Write or load a script and press Generate Speech'}
             </p>
           </div>
         </div>
@@ -241,16 +275,16 @@ export function AudioPlayerBar({
               type="range"
               aria-label="Audio playback position"
               min={0}
-              max={duration > 0 ? duration : 1}
-              step={0.05}
-              value={Math.min(currentTime, duration > 0 ? duration : 1)}
+              max={duration > 0 ? duration : track?.durationSec || 1}
+              step={0.02}
+              value={Math.min(currentTime, duration > 0 ? duration : track?.durationSec || 1)}
               disabled={!track}
               onChange={(e) => seekTo(Number(e.target.value), false)}
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-default"
             />
           </div>
           <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 w-9 shrink-0">
-            {formatAudioTime(duration)}
+            {formatAudioTime(duration || track?.durationSec || 0)}
           </span>
         </div>
 
@@ -290,15 +324,25 @@ export function AudioPlayerBar({
           </div>
 
           {track?.wordTimings && track.wordTimings.length > 0 && (
-            <button
-              type="button"
-              onClick={() => handleDownloadSubtitles('srt')}
-              aria-label="Download SRT subtitles"
-              className="hidden md:inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Captions className="w-3.5 h-3.5" />
-              <span>.SRT</span>
-            </button>
+            <div className="hidden md:flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => handleDownloadSubtitles('srt')}
+                aria-label="Download SRT subtitles"
+                className="inline-flex items-center gap-1.5 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Captions className="w-3.5 h-3.5" />
+                <span>.SRT</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDownloadSubtitles('vtt')}
+                aria-label="Download VTT subtitles"
+                className="inline-flex items-center px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                <span>.VTT</span>
+              </button>
+            </div>
           )}
 
           {track?.audioUrl && (

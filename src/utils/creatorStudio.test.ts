@@ -6,7 +6,12 @@ import {
   splitScriptIntoSegments,
   stripInlinePerformanceTags,
 } from './pronunciationAndEmotion';
-import { alignWordsToEnvelope, generateSubtitles } from './subtitleGenerator';
+import {
+  alignWordsToEnvelope,
+  alignWordsToWavPcm,
+  generateSubtitles,
+  generate_subtitles,
+} from './subtitleGenerator';
 import {
   applyMasteringPresetMono,
   encodeWavBuffer,
@@ -20,7 +25,21 @@ import {
   timeStretchMonoPcm,
   trimSilenceMono,
 } from '../server/wavAudio';
-import { selectTtsModel, splitLongScriptIntoChunks } from './speechLogic';
+import {
+  selectTtsModel,
+  splitLongScriptIntoChunkPlans,
+  splitLongScriptIntoChunks,
+} from './speechLogic';
+import {
+  InputValidationError,
+  QuotaExhaustedError,
+  clearModelCooldowns,
+  extractRetryAfterSeconds,
+  isModelOnCooldown,
+  isQuotaOrRateError,
+  mapApiError,
+  markModelCooldown,
+} from '../server/quotaError';
 import { generate, normalizeWordTimings } from './generateClient';
 import type { GenerateRequestPayload, PronunciationEntry } from '../types';
 
@@ -256,6 +275,7 @@ test('generate utility normalizes word-level start/end offsets and waveformPeaks
 
   const result = await generate(mockPayload, fakeFetch);
   assert.equal(result.modelUsed, 'gemini-3.8-flash-lite-tts');
+  assert.equal(result.timingSource, 'forced_alignment');
   assert.equal(result.wordTimings?.length, 4);
   assert.deepEqual(result.wordTimings?.[1], {
     word: 'lightning',
@@ -271,5 +291,110 @@ test('generate utility normalizes word-level start/end offsets and waveformPeaks
   ]);
   assert.equal(directNormalized[0].startSeconds, 0.1);
   assert.equal(directNormalized[0].endSeconds, 0.42);
+});
+
+test('quotaError detects nested 429 / quota / rate-limit errors, tracks cooldowns, and never maps 429 to INVALID_ARGUMENT', () => {
+  clearModelCooldowns();
+
+  const nestedCauseErr = {
+    message: 'Request failed',
+    cause: {
+      response: {
+        data: {
+          error: {
+            code: 429,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'You exceeded your current quota. Please retry in 45s.',
+          },
+        },
+      },
+    },
+  };
+  assert.equal(isQuotaOrRateError(nestedCauseErr), true);
+  assert.equal(extractRetryAfterSeconds(nestedCauseErr), 45);
+
+  const mapped429 = mapApiError(nestedCauseErr);
+  assert.equal(mapped429.status, 429);
+  assert.equal(mapped429.error_code, 'RESOURCE_EXHAUSTED');
+  assert.equal(mapped429.retryable, true);
+  assert.equal(mapped429.retryAfterSeconds, 45);
+
+  const rateLimitStrErr = new Error('Provider rate limit exceeded for tier');
+  assert.equal(isQuotaOrRateError(rateLimitStrErr), true);
+  assert.equal(mapApiError(rateLimitStrErr).error_code, 'RESOURCE_EXHAUSTED');
+
+  const qErr = new QuotaExhaustedError({
+    attemptedModels: ['gemini-3.8-flash-lite-tts', 'gemini-2.5-flash-preview-tts'],
+    retryAfterSeconds: 120,
+  });
+  const qMapped = mapApiError(qErr);
+  assert.equal(qMapped.status, 429);
+  assert.equal(qMapped.error_code, 'RESOURCE_EXHAUSTED');
+  assert.deepEqual(qMapped.attemptedModels, [
+    'gemini-3.8-flash-lite-tts',
+    'gemini-2.5-flash-preview-tts',
+  ]);
+
+  const badInputErr = new InputValidationError('Empty script');
+  assert.equal(mapApiError(badInputErr).status, 400);
+  assert.equal(mapApiError(badInputErr).error_code, 'INVALID_ARGUMENT');
+
+  markModelCooldown('gemini-3.8-flash-lite-tts', 30);
+  assert.equal(isModelOnCooldown('gemini-3.8-flash-lite-tts'), true);
+  clearModelCooldowns();
+  assert.equal(isModelOnCooldown('gemini-3.8-flash-lite-tts'), false);
+});
+
+test('alignWordsToWavPcm performs real PCM forced alignment and generate_subtitles respects maxLines & maxDurationSeconds', () => {
+  const sampleRate = 24000;
+  const totalSamples = sampleRate * 2; // 2.0s
+  const pcm = new Int16Array(totalSamples);
+
+  // Create two distinct voiced pulses separated by a quiet silence gap:
+  // Pulse 1: 0.10s..0.80s ("Hello world")
+  // Silence: 0.80s..1.10s
+  // Pulse 2: 1.10s..1.85s ("Svara speaks")
+  for (let i = Math.round(0.1 * sampleRate); i < Math.round(0.8 * sampleRate); i += 1) {
+    pcm[i] = Math.round(12000 * Math.sin((2 * Math.PI * 240 * i) / sampleRate));
+  }
+  for (let i = Math.round(1.1 * sampleRate); i < Math.round(1.85 * sampleRate); i += 1) {
+    pcm[i] = Math.round(12000 * Math.sin((2 * Math.PI * 260 * i) / sampleRate));
+  }
+
+  const aligned = alignWordsToWavPcm('Hello world, Svara speaks!', pcm, sampleRate, 1);
+  assert.equal(aligned.timingSource, 'forced_alignment');
+  assert.ok(aligned.timingConfidence >= 0.75);
+  assert.equal(aligned.wordTimings.length, 4);
+  assert.ok(aligned.wordTimings[0].startMs >= 80);
+  assert.ok(aligned.wordTimings[2].startMs >= 1050);
+
+  const srt = generate_subtitles({
+    wordTimings: aligned.wordTimings,
+    format: 'srt',
+    preset: 'clean_editorial',
+    maxLines: 1,
+    maxDurationSeconds: 1.0,
+  });
+  assert.match(srt, /-->/);
+  assert.match(srt, /Hello world,/);
+
+  const vtt = generate_subtitles({
+    wordTimings: aligned.wordTimings,
+    format: 'vtt',
+    maxLines: 2,
+    maxDurationSeconds: 1.5,
+  });
+  assert.match(vtt, /^WEBVTT/);
+});
+
+test('splitLongScriptIntoChunkPlans preserves paragraph pauses and active [EMOTION] tags', () => {
+  const longPara = 'Lightning rises upward from thunderclouds toward the ionosphere. '.repeat(70);
+  const script = `[CURIOUS] ${longPara}\n\n[AWE] Above the storm, blue jets pierce the stratosphere.`;
+  const plans = splitLongScriptIntoChunkPlans(script, 1500);
+  assert.ok(plans.length >= 3);
+  assert.equal(plans[0].emotion, 'CURIOUS');
+  assert.equal(plans[plans.length - 1].emotion, 'AWE');
+  assert.ok(plans[0].breakAfterMs > 0);
+  assert.equal(plans[plans.length - 1].breakAfterMs, 0);
 });
 

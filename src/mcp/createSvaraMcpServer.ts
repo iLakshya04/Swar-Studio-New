@@ -1,4 +1,5 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { VOICE_PRESETS } from '../data/voices';
 import {
@@ -21,6 +22,7 @@ import {
 import {
   analyzeVoiceBuffer,
   localizeNarration,
+  mapApiError,
   matchAudioDuration,
   regenerateClipSegment,
   replaceAudioSegmentFromBuffer,
@@ -33,25 +35,55 @@ import { filterVoices } from '../utils/speechLogic';
 import { generateSubtitles } from '../utils/subtitleGenerator';
 import type { GenerateResponsePayload, SubtitleFormat, SubtitlePreset } from '../types';
 
-const SVARA_MCP_INSTRUCTIONS = `Svara Studio is a bilingual English, Hindi (हिन्दी), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
+export const SVARA_MCP_VERSION = '2.2.0';
+export const SVARA_MCP_BUILD = '2026-11-16.2';
+
+const SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (हिन्दी), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
 Recommended creator workflow:
 1. Discover voices via list_voices or inspect saved presets via list_voice_presets, and audition quickly with preview_voice.
 2. Register proper nouns or tricky words once with add_pronunciation so English and Hindi scripts speak them cleanly.
-3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns both a native MCP file resource/resource_link and structured metadata including wordTimings, phraseTimings, and speechEnvelope (for music ducking).
-4. Generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions directly from any clipId via generate_subtitles without re-transcribing.
+3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordTimings, waveformPeaks, timingSource, timingConfidence, and speechEnvelope.
+4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions via generate_subtitles without re-transcribing.
 5. Use localize_narration for simultaneous Hindi/Hinglish/English dubs, or pass existing files via audioFile/clipId to transcribe_audio, dub_audio, match_duration, analyze_voice, and replace_segment.`;
+
+function handleMcpToolError(error: unknown): CallToolResult {
+  const mapped = mapApiError(error);
+  const errorPayload = {
+    error_code: mapped.error_code,
+    retryable: mapped.retryable,
+    ...(typeof mapped.retryAfterSeconds === 'number'
+      ? { retryAfterSeconds: mapped.retryAfterSeconds }
+      : {}),
+    ...(mapped.attemptedModels?.length ? { attemptedModels: mapped.attemptedModels } : {}),
+    message: mapped.message,
+  };
+
+  return {
+    isError: true,
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(errorPayload, null, 2),
+      },
+    ],
+    structuredContent: errorPayload,
+  };
+}
 
 function buildAudioToolResult(
   publicBaseUrl: string,
   res: GenerateResponsePayload,
   extraMeta: Record<string, unknown> = {}
-) {
+): CallToolResult {
   const base = publicBaseUrl.replace(/\/$/, '');
   const fullAudioUrl = `${base}${res.audioUrl}`;
   const fullDownloadUrl = `${base}${res.downloadUrl || `${res.audioUrl}?download=1`}`;
   const ext = res.format || 'wav';
   const fileName = `svara-${res.clipId}.${ext}`;
   const resourceUri = `svara://clips/${fileName}`;
+  const durationMs = res.durationMs ?? (res.durationEstimateSec || 1) * 1000;
+  const durationSeconds = Number((durationMs / 1000).toFixed(2));
+  const voiceUsed = res.voiceUsed || res.voiceName || 'Svara Voice';
 
   const structuredPayload: Record<string, unknown> = {
     status: 'synthesized',
@@ -70,50 +102,46 @@ function buildAudioToolResult(
     audioUrl: fullAudioUrl,
     downloadUrl: fullDownloadUrl,
     mimeType: res.mimeType,
-    durationMs: res.durationMs ?? (res.durationEstimateSec || 1) * 1000,
-    durationSeconds: Number(((res.durationMs ?? res.durationEstimateSec * 1000) / 1000).toFixed(2)),
+    format: ext,
+    durationMs,
+    durationSeconds,
     sampleRate: res.sampleRate ?? 48000,
     channels: res.channels ?? 1,
     voiceId: res.voiceId,
     voiceName: res.voiceName,
+    voiceUsed,
     model: res.modelUsed,
+    modelUsed: res.modelUsed,
+    timingSource: res.timingSource || 'forced_alignment',
+    timingConfidence: res.timingConfidence ?? 0.85,
     appliedPronunciations: res.appliedPronunciations ?? [],
-    wordTimings: res.wordTimings ?? [],
-    phraseTimings: res.phraseTimings ?? [],
-    speechEnvelope: res.speechEnvelope ?? [],
+    ...(res.wordTimings ? { wordTimings: res.wordTimings } : {}),
+    ...(res.phraseTimings ? { phraseTimings: res.phraseTimings } : {}),
     ...(res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {}),
+    speechEnvelope: res.speechEnvelope ?? [],
     ...(res.segments ? { segments: res.segments } : {}),
     ...(res.stems ? { stems: res.stems } : {}),
     ...extraMeta,
   };
 
-  const content: Array<
-    | { type: 'text'; text: string }
-    | {
-        type: 'resource_link';
-        uri: string;
-        name: string;
-        title?: string;
-        mimeType?: string;
-        size?: number;
-      }
-    | {
-        type: 'resource';
-        resource: { uri: string; mimeType?: string; blob: string };
-      }
-  > = [
+  const content: CallToolResult['content'] = [
     {
       type: 'resource_link',
       uri: fullDownloadUrl,
       name: fileName,
-      title: `${res.voiceName || 'Svara'} (${ext.toUpperCase()})`,
+      title: `${voiceUsed} (${ext.toUpperCase()})`,
       mimeType: res.mimeType,
       size: res.sizeBytes,
     },
   ];
 
-  // Embed native binary file blob for direct handoff when under 16 MB base64
+  // Attach native MCP audio block + binary resource blob when under 16 MB base64
   if (res.audioBase64 && res.audioBase64.length <= 16_000_000) {
+    content.push({
+      type: 'audio',
+      data: res.audioBase64,
+      mimeType: res.mimeType,
+    });
     content.push({
       type: 'resource',
       resource: {
@@ -124,9 +152,13 @@ function buildAudioToolResult(
     });
   }
 
+  const rateKhz = ((res.sampleRate ?? 48000) / 1000).toFixed(res.sampleRate === 44100 ? 1 : 0);
+  const channelLabel = res.channels === 2 ? 'stereo' : 'mono';
+  const wordCount = res.wordTimings?.length ?? 0;
+
   content.push({
     type: 'text',
-    text: JSON.stringify(structuredPayload, null, 2),
+    text: `Synthesized ${durationSeconds}s ${ext.toUpperCase()} (${rateKhz} kHz ${channelLabel}) with ${voiceUsed} via ${res.modelUsed}. Clip ID: ${res.clipId} · Words: ${wordCount} (${structuredPayload.timingSource}). Download: ${fullDownloadUrl}`,
   });
 
   return {
@@ -163,7 +195,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
   const server = new McpServer(
     {
       name: 'svara-studio',
-      version: '2.0.0',
+      version: SVARA_MCP_VERSION,
     },
     {
       instructions: SVARA_MCP_INSTRUCTIONS,
@@ -284,7 +316,12 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       }));
 
       return {
-        content: [{ type: 'text', text: JSON.stringify({ count: voices.length, voices }, null, 2) }],
+        content: [
+          {
+            type: 'text',
+            text: `Found ${voices.length} Svara Studio voices (${voices.slice(0, 5).map((v) => `${v.id}: ${v.name}`).join(', ')}${voices.length > 5 ? ', ...' : ''}).`,
+          },
+        ],
         structuredContent: { count: voices.length, voices },
       };
     }
@@ -303,37 +340,42 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async ({ voiceId, sampleText, stylePrompt }) => {
-      const preset = VOICE_PRESETS.find((v) => v.id === voiceId) ?? VOICE_PRESETS[0];
-      const res = await synthesizeSpeech({
-        mode: 'single',
-        language: preset.sampleLanguage,
-        modelTier: 'standard',
-        text: sampleText?.trim() || preset.sampleText,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: stylePrompt || preset.defaultStyle,
-        speed: 1.0,
-        sampleRate: 48000,
-        channels: 1,
-        normalize: true,
-        trimSilence: true,
-      });
-      return buildAudioToolResult(publicBaseUrl, res, { previewOf: preset.id });
+      try {
+        const preset = VOICE_PRESETS.find((v) => v.id === voiceId) ?? VOICE_PRESETS[0];
+        const res = await synthesizeSpeech({
+          mode: 'single',
+          language: preset.sampleLanguage,
+          modelTier: 'standard',
+          text: sampleText?.trim() || preset.sampleText,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: stylePrompt || preset.defaultStyle,
+          speed: 1.0,
+          sampleRate: 48000,
+          channels: 1,
+          normalize: true,
+          trimSilence: true,
+        });
+        return buildAudioToolResult(publicBaseUrl, res, { previewOf: preset.id });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 3. generate_speech (native file output + word timings + mastering + target duration)
+  // 3. generate_speech (native audio attachment + file resource + forced-aligned timings + fallback routing)
   server.registerTool(
     'generate_speech',
     {
       title: 'Generate Production Speech & Native Audio File',
       description:
-        'Synthesize creator-ready speech in English, Hindi, or Hinglish. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, silence trimming, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native audio file output + word/phrase timestamps + speechEnvelope.',
+        'Synthesize creator-ready speech in English, Hindi, or Hinglish with automatic multi-model/provider fallback routing. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native MCP audio + resource_link + forced-aligned wordTimings + waveformPeaks + speechEnvelope.',
       inputSchema: {
         text: z.string().min(1),
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe('Optional saved preset ID or name from list_voice_presets.'),
         language: z.enum(['en', 'hi', 'bilingual']).optional(),
+        modelTier: z.enum(['standard', 'expressive']).optional(),
         stylePrompt: z.string().optional(),
         customVoiceDescription: z.string().optional(),
         speed: z.number().min(0.7).max(1.4).optional(),
@@ -341,7 +383,8 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         emotionIntensity: z.enum(['subtle', 'natural', 'dramatic']).optional(),
         expressiveControls: ExpressiveControlsSchema,
         seed: z.number().int().optional(),
-        format: z.enum(['wav', 'mp3', 'm4a', 'flac']).optional().default('wav'),
+        format: z.enum(['wav', 'mp3', 'm4a', 'flac']).optional(),
+        outputFormat: z.enum(['wav', 'mp3', 'm4a', 'flac']).optional(),
         sampleRate: z.union([z.literal(24000), z.literal(44100), z.literal(48000)]).optional().default(48000),
         channels: z.union([z.literal(1), z.literal(2)]).optional().default(1),
         bitrateKbps: z.number().min(64).max(320).optional(),
@@ -354,48 +397,144 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         targetDurationSeconds: z.number().min(0.5).max(300).optional(),
         durationToleranceSeconds: z.number().min(0.05).max(5).optional(),
         fitMode: z.enum(['natural', 'tight', 'stretch']).optional(),
+        returnWordTimings: z.boolean().optional().default(true),
+        returnWaveformPeaks: z.boolean().optional().default(true),
         projectId: z.string().optional(),
       },
     },
     async (args) => {
-      const savedPreset = args.voicePresetId ? getVoicePreset(args.voicePresetId) : undefined;
-      const language = args.language ?? savedPreset?.language ?? 'en';
-      const fallbackVoiceId = language === 'hi' ? 'aarav' : language === 'bilingual' ? 'vikram' : 'ethan';
-      const effectiveVoiceId = args.voiceId ?? savedPreset?.voiceId ?? fallbackVoiceId;
-      const preset = VOICE_PRESETS.find((v) => v.id === effectiveVoiceId) ?? VOICE_PRESETS[0];
+      try {
+        const savedPreset = args.voicePresetId ? getVoicePreset(args.voicePresetId) : undefined;
+        const language = args.language ?? savedPreset?.language ?? 'en';
+        const fallbackVoiceId = language === 'hi' ? 'aarav' : language === 'bilingual' ? 'vikram' : 'ethan';
+        const effectiveVoiceId = args.voiceId ?? savedPreset?.voiceId ?? fallbackVoiceId;
+        const preset = VOICE_PRESETS.find((v) => v.id === effectiveVoiceId) ?? VOICE_PRESETS[0];
+        const chosenFormat = args.format ?? args.outputFormat ?? 'wav';
+        const chosenTier =
+          args.modelTier ??
+          (args.expressiveControls || args.customVoiceDescription ? 'expressive' : 'standard');
 
-      const res = await synthesizeSpeech({
-        mode: 'single',
-        language,
-        modelTier: args.expressiveControls || args.customVoiceDescription ? 'expressive' : 'standard',
-        text: args.text,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: args.stylePrompt ?? savedPreset?.stylePrompt ?? preset.defaultStyle,
-        customVoiceDescription: args.customVoiceDescription ?? savedPreset?.customVoiceDescription,
-        speed: args.speed ?? savedPreset?.speed ?? 1.0,
-        pitchRegister: args.pitchRegister ?? savedPreset?.pitchRegister ?? 'balanced',
-        emotionIntensity: args.emotionIntensity ?? savedPreset?.emotionIntensity ?? 'natural',
-        expressiveControls: args.expressiveControls ?? savedPreset?.expressiveControls,
-        seed: args.seed,
-        format: args.format,
-        sampleRate: args.sampleRate ?? savedPreset?.sampleRate ?? 48000,
-        channels: args.channels ?? savedPreset?.channels ?? 1,
-        bitrateKbps: args.bitrateKbps,
-        normalize: args.normalize,
-        trimSilence: args.trimSilence,
-        masteringPreset: args.masteringPreset !== 'none' ? args.masteringPreset : (savedPreset?.masteringPreset ?? 'none'),
-        targetDurationSeconds: args.targetDurationSeconds,
-        durationToleranceSeconds: args.durationToleranceSeconds,
-        fitMode: args.fitMode,
-        projectId: args.projectId,
-      });
+        const res = await synthesizeSpeech({
+          mode: 'single',
+          language,
+          modelTier: chosenTier,
+          text: args.text,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: args.stylePrompt ?? savedPreset?.stylePrompt ?? preset.defaultStyle,
+          customVoiceDescription: args.customVoiceDescription ?? savedPreset?.customVoiceDescription,
+          speed: args.speed ?? savedPreset?.speed ?? 1.0,
+          pitchRegister: args.pitchRegister ?? savedPreset?.pitchRegister ?? 'balanced',
+          emotionIntensity: args.emotionIntensity ?? savedPreset?.emotionIntensity ?? 'natural',
+          expressiveControls: args.expressiveControls ?? savedPreset?.expressiveControls,
+          seed: args.seed,
+          format: chosenFormat,
+          sampleRate: args.sampleRate ?? savedPreset?.sampleRate ?? 48000,
+          channels: args.channels ?? savedPreset?.channels ?? 1,
+          bitrateKbps: args.bitrateKbps,
+          normalize: args.normalize,
+          trimSilence: args.trimSilence,
+          masteringPreset:
+            args.masteringPreset !== 'none'
+              ? args.masteringPreset
+              : (savedPreset?.masteringPreset ?? 'none'),
+          targetDurationSeconds: args.targetDurationSeconds,
+          durationToleranceSeconds: args.durationToleranceSeconds,
+          fitMode: args.fitMode,
+          returnWordTimings: args.returnWordTimings,
+          returnWaveformPeaks: args.returnWaveformPeaks,
+          projectId: args.projectId,
+        });
 
-      return buildAudioToolResult(publicBaseUrl, res);
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 4. generate_speech_segments
+  // 4. get_clip (retrieve previously generated clip audio + metadata by clipId)
+  server.registerTool(
+    'get_clip',
+    {
+      title: 'Retrieve Saved Clip Audio & Metadata',
+      description:
+        'Retrieve a previously generated Svara Studio clip by clipId, returning a fresh audio attachment, download URL, script, voiceUsed, modelUsed, durationMs, timingSource, timingConfidence, wordTimings, and waveformPeaks.',
+      inputSchema: {
+        clipId: z.string().min(1),
+      },
+    },
+    async ({ clipId }) => {
+      try {
+        const found = getClipAudioBuffer(clipId, false);
+        if (!found) {
+          throw new Error(`Clip '${clipId}' not found.`);
+        }
+        const rec = found.record;
+        const base = publicBaseUrl.replace(/\/$/, '');
+        const audioUrl = `${base}/api/clips/${rec.id}.${found.ext}`;
+        const downloadUrl = `${audioUrl}?download=1`;
+        const fileName = `svara-${rec.id}.${found.ext}`;
+        const base64 = found.buffer.toString('base64');
+
+        const structuredPayload: Record<string, unknown> = {
+          clipId: rec.id,
+          audioUrl,
+          downloadUrl,
+          mimeType: found.mimeType,
+          format: found.ext,
+          sizeBytes: found.buffer.length,
+          sampleRate: rec.sampleRate,
+          channels: rec.channels,
+          script: rec.displayText,
+          voiceId: rec.voiceId,
+          voiceUsed: rec.voiceName,
+          modelUsed: rec.modelUsed,
+          durationMs: rec.durationMs,
+          durationSeconds: Number((rec.durationMs / 1000).toFixed(2)),
+          timingSource: rec.timingSource || 'forced_alignment',
+          timingConfidence: rec.timingConfidence ?? 0.85,
+          wordTimings: rec.wordTimings,
+          phraseTimings: rec.phraseTimings,
+          waveformPeaks: rec.waveformPeaks ?? [],
+          speechEnvelope: rec.speechEnvelope,
+          segments: rec.segments,
+          createdAt: rec.createdAt,
+        };
+
+        const content: CallToolResult['content'] = [
+          {
+            type: 'resource_link',
+            uri: downloadUrl,
+            name: fileName,
+            title: `${rec.voiceName} (${found.ext.toUpperCase()})`,
+            mimeType: found.mimeType,
+            size: found.buffer.length,
+          },
+        ];
+        if (base64.length <= 16_000_000) {
+          content.push({
+            type: 'audio',
+            data: base64,
+            mimeType: found.mimeType,
+          });
+        }
+        content.push({
+          type: 'text',
+          text: `Loaded clip ${rec.id} (${(rec.durationMs / 1000).toFixed(2)}s, ${rec.voiceName}, ${rec.modelUsed}). Download: ${downloadUrl}`,
+        });
+
+        return {
+          content,
+          structuredContent: structuredPayload,
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
+    }
+  );
+
+  // 5. generate_speech_segments
   server.registerTool(
     'generate_speech_segments',
     {
@@ -417,26 +556,30 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const preset = VOICE_PRESETS.find((v) => v.id === (args.voiceId || 'ethan')) ?? VOICE_PRESETS[0];
-      const res = await synthesizeSpeech({
-        mode: 'single',
-        language: args.language,
-        modelTier: 'standard',
-        text: args.text,
-        voiceId: preset.id,
-        voiceName: preset.baseVoice,
-        stylePrompt: args.stylePrompt ?? preset.defaultStyle,
-        speed: args.speed,
-        sampleRate: args.sampleRate,
-        channels: args.channels,
-        masteringPreset: args.masteringPreset,
-        segmentMode: true,
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const preset = VOICE_PRESETS.find((v) => v.id === (args.voiceId || 'ethan')) ?? VOICE_PRESETS[0];
+        const res = await synthesizeSpeech({
+          mode: 'single',
+          language: args.language,
+          modelTier: 'standard',
+          text: args.text,
+          voiceId: preset.id,
+          voiceName: preset.baseVoice,
+          stylePrompt: args.stylePrompt ?? preset.defaultStyle,
+          speed: args.speed,
+          sampleRate: args.sampleRate,
+          channels: args.channels,
+          masteringPreset: args.masteringPreset,
+          segmentMode: true,
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 5. regenerate_segment
+  // 6. regenerate_segment
   server.registerTool(
     'regenerate_segment',
     {
@@ -454,18 +597,22 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const res = await regenerateClipSegment(args);
-      return buildAudioToolResult(publicBaseUrl, res, { regeneratedSegmentIndex: args.segmentIndex });
+      try {
+        const res = await regenerateClipSegment(args);
+        return buildAudioToolResult(publicBaseUrl, res, { regeneratedSegmentIndex: args.segmentIndex });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 6. generate_subtitles
+  // 7. generate_subtitles
   server.registerTool(
     'generate_subtitles',
     {
       title: 'Generate Synchronized Subtitles (.SRT, .VTT, .ASS, JSON)',
       description:
-        'Generate time-aligned captions from a synthesized clipId. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).',
+        'Generate time-aligned captions from a synthesized clipId based on duration and line constraints. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).',
       inputSchema: {
         clipId: z.string(),
         format: z.enum(['srt', 'vtt', 'ass', 'json']).default('ass'),
@@ -473,6 +620,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         maxLines: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional().default(3),
         maxCharsPerLine: z.number().int().min(10).max(80).optional(),
         maxPhraseDurationMs: z.number().int().min(800).max(10000).optional(),
+        maxDurationSeconds: z.number().min(0.8).max(12).optional(),
         safeAreaMarginV: z.number().int().min(20).max(800).optional(),
       },
     },
@@ -483,75 +631,72 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       maxLines,
       maxCharsPerLine,
       maxPhraseDurationMs,
+      maxDurationSeconds,
       safeAreaMarginV,
     }) => {
-      const record = getClipRecord(clipId);
-      if (!record) {
-        throw new Error(`Clip '${clipId}' not found.`);
-      }
-      const subtitleText = generateSubtitles({
-        wordTimings: record.wordTimings,
-        format: format as SubtitleFormat,
-        preset: preset as SubtitlePreset,
-        maxLines: maxLines as 1 | 2 | 3,
-        maxCharsPerLine,
-        maxPhraseDurationMs,
-        safeAreaMarginV,
-      });
+      try {
+        const record = getClipRecord(clipId);
+        if (!record) {
+          throw new Error(`Clip '${clipId}' not found.`);
+        }
+        const subtitleText = generateSubtitles({
+          wordTimings: record.wordTimings,
+          format: format as SubtitleFormat,
+          preset: preset as SubtitlePreset,
+          maxLines: maxLines as 1 | 2 | 3,
+          maxCharsPerLine,
+          maxPhraseDurationMs,
+          maxDurationSeconds,
+          safeAreaMarginV,
+        });
 
-      const downloadUrl = `${publicBaseUrl.replace(/\/$/, '')}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
-      const mimeMap: Record<string, string> = {
-        srt: 'application/x-subrip',
-        vtt: 'text/vtt',
-        ass: 'text/x-ssa',
-        json: 'application/json',
-      };
+        const downloadUrl = `${publicBaseUrl.replace(/\/$/, '')}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
+        const mimeMap: Record<string, string> = {
+          srt: 'application/x-subrip',
+          vtt: 'text/vtt',
+          ass: 'text/x-ssa',
+          json: 'application/json',
+        };
 
-      return {
-        content: [
-          {
-            type: 'resource_link',
-            uri: downloadUrl,
-            name: `svara-${clipId}.${format}`,
-            title: `Subtitles (${preset}, ${format.toUpperCase()})`,
-            mimeType: mimeMap[format],
-          },
-          {
-            type: 'resource',
-            resource: {
-              uri: `svara://clips/${clipId}.${format}`,
+        return {
+          content: [
+            {
+              type: 'resource_link',
+              uri: downloadUrl,
+              name: `svara-${clipId}.${format}`,
+              title: `Subtitles (${preset}, ${format.toUpperCase()})`,
               mimeType: mimeMap[format],
-              text: subtitleText,
             },
-          },
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                clipId,
-                format,
-                preset,
-                downloadUrl,
-                cueCount: record.phraseTimings.length,
-                content: subtitleText,
+            {
+              type: 'resource',
+              resource: {
+                uri: `svara://clips/${clipId}.${format}`,
+                mimeType: mimeMap[format],
+                text: subtitleText,
               },
-              null,
-              2
-            ),
+            },
+            {
+              type: 'text',
+              text: `Generated ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`,
+            },
+          ],
+          structuredContent: {
+            clipId,
+            format,
+            preset,
+            maxLines,
+            timingSource: record.timingSource || 'forced_alignment',
+            downloadUrl,
+            content: subtitleText,
           },
-        ],
-        structuredContent: {
-          clipId,
-          format,
-          preset,
-          downloadUrl,
-          content: subtitleText,
-        },
-      };
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 7. generate_dialogue (up to 6 speakers + stems)
+  // 8. generate_dialogue (up to 6 speakers + stems)
   server.registerTool(
     'generate_dialogue',
     {
@@ -592,67 +737,71 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const speakerList = args.speakers?.length
-        ? args.speakers.map((s) => {
-            const p = VOICE_PRESETS.find((v) => v.id === s.voiceId) ?? VOICE_PRESETS[0];
-            return {
-              id: s.key,
-              name: s.name,
-              voiceId: p.id,
-              baseVoice: p.baseVoice,
-              style: s.style || p.defaultStyle,
-            };
-          })
-        : [
-            (() => {
-              const p = VOICE_PRESETS.find((v) => v.id === (args.speakerAVoiceId || 'vikram')) ?? VOICE_PRESETS[3];
+      try {
+        const speakerList = args.speakers?.length
+          ? args.speakers.map((s) => {
+              const p = VOICE_PRESETS.find((v) => v.id === s.voiceId) ?? VOICE_PRESETS[0];
               return {
-                id: 'A',
-                name: args.speakerAName || 'Vikram',
+                id: s.key,
+                name: s.name,
                 voiceId: p.id,
                 baseVoice: p.baseVoice,
-                style: args.speakerAStyle || p.defaultStyle,
+                style: s.style || p.defaultStyle,
               };
-            })(),
-            (() => {
-              const p = VOICE_PRESETS.find((v) => v.id === (args.speakerBVoiceId || 'ananya')) ?? VOICE_PRESETS[1];
-              return {
-                id: 'B',
-                name: args.speakerBName || 'Ananya',
-                voiceId: p.id,
-                baseVoice: p.baseVoice,
-                style: args.speakerBStyle || p.defaultStyle,
-              };
-            })(),
-          ];
+            })
+          : [
+              (() => {
+                const p = VOICE_PRESETS.find((v) => v.id === (args.speakerAVoiceId || 'vikram')) ?? VOICE_PRESETS[3];
+                return {
+                  id: 'A',
+                  name: args.speakerAName || 'Vikram',
+                  voiceId: p.id,
+                  baseVoice: p.baseVoice,
+                  style: args.speakerAStyle || p.defaultStyle,
+                };
+              })(),
+              (() => {
+                const p = VOICE_PRESETS.find((v) => v.id === (args.speakerBVoiceId || 'ananya')) ?? VOICE_PRESETS[1];
+                return {
+                  id: 'B',
+                  name: args.speakerBName || 'Ananya',
+                  voiceId: p.id,
+                  baseVoice: p.baseVoice,
+                  style: args.speakerBStyle || p.defaultStyle,
+                };
+              })(),
+            ];
 
-      const res = await synthesizeSpeech({
-        mode: 'multi',
-        language: args.language,
-        modelTier: 'standard',
-        text: '',
-        voiceName: speakerList[0].baseVoice,
-        stylePrompt: '',
-        speed: args.speed,
-        speakerList,
-        separateStems: args.separateStems,
-        dialogueLines: args.turns.map((t, i) => ({
-          id: `turn-${i + 1}`,
-          speakerKey: t.speaker,
-          text: t.text,
-          emotion: t.emotion,
-        })),
-        sampleRate: 48000,
-        channels: 1,
-      });
+        const res = await synthesizeSpeech({
+          mode: 'multi',
+          language: args.language,
+          modelTier: 'standard',
+          text: '',
+          voiceName: speakerList[0].baseVoice,
+          stylePrompt: '',
+          speed: args.speed,
+          speakerList,
+          separateStems: args.separateStems,
+          dialogueLines: args.turns.map((t, i) => ({
+            id: `turn-${i + 1}`,
+            speakerKey: t.speaker,
+            text: t.text,
+            emotion: t.emotion,
+          })),
+          sampleRate: 48000,
+          channels: 1,
+        });
 
-      return buildAudioToolResult(publicBaseUrl, res, {
-        speakers: speakerList.map((s) => s.name),
-      });
+        return buildAudioToolResult(publicBaseUrl, res, {
+          speakers: speakerList.map((s) => s.name),
+        });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 8. translate_tts_script & 9. localize_narration
+  // 9. translate_tts_script & 10. localize_narration
   server.registerTool(
     'translate_tts_script',
     {
@@ -665,11 +814,15 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async ({ text, targetLanguage, preserveDuration }) => {
-      const translatedText = await translateSpeechScript(text, targetLanguage, preserveDuration);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ targetLanguage, translatedText }, null, 2) }],
-        structuredContent: { targetLanguage, translatedText },
-      };
+      try {
+        const translatedText = await translateSpeechScript(text, targetLanguage, preserveDuration);
+        return {
+          content: [{ type: 'text', text: translatedText }],
+          structuredContent: { targetLanguage, translatedText },
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
@@ -688,34 +841,56 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const localized = await localizeNarration(args);
-      const base = publicBaseUrl.replace(/\/$/, '');
-      const summary = localized.map((item) => ({
-        language: item.language,
-        script: item.script,
-        clipId: item.result.clipId,
-        audioUrl: `${base}${item.result.audioUrl}`,
-        downloadUrl: `${base}${item.result.downloadUrl}`,
-        durationMs: item.result.durationMs,
-        wordTimings: item.result.wordTimings,
-        srt: item.srt,
-      }));
-      return {
-        content: [
-          ...localized.map((item) => ({
-            type: 'resource_link' as const,
+      try {
+        const localized = await localizeNarration(args);
+        const base = publicBaseUrl.replace(/\/$/, '');
+        const summary = localized.map((item) => ({
+          language: item.language,
+          script: item.script,
+          clipId: item.result.clipId,
+          audioUrl: `${base}${item.result.audioUrl}`,
+          downloadUrl: `${base}${item.result.downloadUrl}`,
+          modelUsed: item.result.modelUsed,
+          voiceUsed: item.result.voiceUsed || item.result.voiceName,
+          durationMs: item.result.durationMs,
+          timingSource: item.result.timingSource,
+          timingConfidence: item.result.timingConfidence,
+          wordTimings: item.result.wordTimings,
+          waveformPeaks: item.result.waveformPeaks,
+          srt: item.srt,
+        }));
+        const content: CallToolResult['content'] = [];
+        for (const item of localized) {
+          content.push({
+            type: 'resource_link',
             uri: `${base}${item.result.downloadUrl}`,
             name: `svara-${item.language}-${item.result.clipId}.wav`,
             mimeType: 'audio/wav',
-          })),
-          { type: 'text', text: JSON.stringify({ localizations: summary }, null, 2) },
-        ],
-        structuredContent: { localizations: summary },
-      };
+          });
+          if (item.result.audioBase64 && item.result.audioBase64.length <= 8_000_000) {
+            content.push({
+              type: 'audio',
+              data: item.result.audioBase64,
+              mimeType: item.result.mimeType,
+            });
+          }
+        }
+        content.push({
+          type: 'text',
+          text: `Localized narration into ${localized.map((i) => `${i.language} (${i.result.clipId})`).join(', ')}.`,
+        });
+
+        return {
+          content,
+          structuredContent: { localizations: summary },
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
-  // 10-12. Pronunciation Dictionary tools
+  // 11-13. Pronunciation Dictionary tools
   server.registerTool(
     'add_pronunciation',
     {
@@ -732,7 +907,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async (args) => {
       const entry = upsertPronunciation(args);
       return {
-        content: [{ type: 'text', text: JSON.stringify(entry, null, 2) }],
+        content: [{ type: 'text', text: `Saved pronunciation rule for "${entry.term}" -> "${entry.phonetic}".` }],
         structuredContent: { entry },
       };
     }
@@ -748,7 +923,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async () => {
       const entries = listPronunciations();
       return {
-        content: [{ type: 'text', text: JSON.stringify({ count: entries.length, entries }, null, 2) }],
+        content: [{ type: 'text', text: `${entries.length} pronunciation rules configured.` }],
         structuredContent: { count: entries.length, entries },
       };
     }
@@ -764,13 +939,13 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async ({ idOrTerm }) => {
       const deleted = deletePronunciation(idOrTerm);
       return {
-        content: [{ type: 'text', text: JSON.stringify({ deleted, idOrTerm }, null, 2) }],
+        content: [{ type: 'text', text: deleted ? `Removed "${idOrTerm}".` : `No rule found for "${idOrTerm}".` }],
         structuredContent: { deleted, idOrTerm },
       };
     }
   );
 
-  // 13-15. Saved Voice Presets
+  // 14-16. Saved Voice Presets
   server.registerTool(
     'create_voice_preset',
     {
@@ -796,7 +971,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async (args) => {
       const preset = upsertVoicePreset(args);
       return {
-        content: [{ type: 'text', text: JSON.stringify(preset, null, 2) }],
+        content: [{ type: 'text', text: `Saved voice preset "${preset.name}" (${preset.id}).` }],
         structuredContent: { preset },
       };
     }
@@ -812,7 +987,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async () => {
       const presets = listVoicePresets();
       return {
-        content: [{ type: 'text', text: JSON.stringify({ count: presets.length, presets }, null, 2) }],
+        content: [{ type: 'text', text: `${presets.length} saved voice presets available.` }],
         structuredContent: { count: presets.length, presets },
       };
     }
@@ -828,13 +1003,13 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async ({ id }) => {
       const deleted = deleteVoicePreset(id);
       return {
-        content: [{ type: 'text', text: JSON.stringify({ deleted, id }, null, 2) }],
+        content: [{ type: 'text', text: deleted ? `Deleted preset ${id}.` : `Preset ${id} not found.` }],
         structuredContent: { deleted, id },
       };
     }
   );
 
-  // 16-22. Project / Session CRUD & Export
+  // 17-23. Project / Session CRUD & Export
   server.registerTool(
     'create_project',
     {
@@ -849,7 +1024,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async (args) => {
       const project = createProject(args);
       return {
-        content: [{ type: 'text', text: JSON.stringify(project, null, 2) }],
+        content: [{ type: 'text', text: `Created project "${project.name}" (${project.id}).` }],
         structuredContent: { project },
       };
     }
@@ -865,7 +1040,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async () => {
       const projects = listProjects();
       return {
-        content: [{ type: 'text', text: JSON.stringify({ count: projects.length, projects }, null, 2) }],
+        content: [{ type: 'text', text: `${projects.length} narration projects found.` }],
         structuredContent: { count: projects.length, projects },
       };
     }
@@ -880,9 +1055,11 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     },
     async ({ projectId }) => {
       const project = getProject(projectId);
-      if (!project) throw new Error(`Project '${projectId}' not found.`);
+      if (!project) {
+        return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
+      }
       return {
-        content: [{ type: 'text', text: JSON.stringify(project, null, 2) }],
+        content: [{ type: 'text', text: `Project "${project.name}" (${project.clips.length} clips).` }],
         structuredContent: { project },
       };
     }
@@ -901,7 +1078,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     },
     async ({ projectId, clipId, title }) => {
       const rec = getClipRecord(clipId);
-      if (!rec) throw new Error(`Clip '${clipId}' not found.`);
+      if (!rec) return handleMcpToolError(new Error(`Clip '${clipId}' not found.`));
       const updated = addClipToProject(projectId, {
         clipId: rec.id,
         title: title || rec.displayText.slice(0, 48),
@@ -915,9 +1092,9 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         audioUrl: `/api/clips/${rec.id}.${rec.format}`,
         downloadUrl: `/api/clips/${rec.id}.${rec.format}?download=1`,
       });
-      if (!updated) throw new Error(`Project '${projectId}' not found.`);
+      if (!updated) return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
       return {
-        content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: 'text', text: `Added clip ${clipId} to project "${updated.name}".` }],
         structuredContent: { project: updated },
       };
     }
@@ -938,9 +1115,9 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     },
     async ({ projectId, clipId, title, text, order }) => {
       const updated = updateProjectClip(projectId, clipId, { title, text, order });
-      if (!updated) throw new Error('Project or clip not found.');
+      if (!updated) return handleMcpToolError(new Error('Project or clip not found.'));
       return {
-        content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: 'text', text: `Updated clip ${clipId} in project "${updated.name}".` }],
         structuredContent: { project: updated },
       };
     }
@@ -955,9 +1132,9 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     },
     async ({ projectId, clipId }) => {
       const updated = deleteProjectClip(projectId, clipId);
-      if (!updated) throw new Error('Project not found.');
+      if (!updated) return handleMcpToolError(new Error('Project not found.'));
       return {
-        content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+        content: [{ type: 'text', text: `Removed clip ${clipId} from project "${updated.name}".` }],
         structuredContent: { project: updated },
       };
     }
@@ -972,7 +1149,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     },
     async ({ projectId }) => {
       const proj = getProject(projectId);
-      if (!proj) throw new Error(`Project '${projectId}' not found.`);
+      if (!proj) return handleMcpToolError(new Error(`Project '${projectId}' not found.`));
       const base = publicBaseUrl.replace(/\/$/, '');
       const manifest = {
         ...proj,
@@ -985,13 +1162,13 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         })),
       };
       return {
-        content: [{ type: 'text', text: JSON.stringify(manifest, null, 2) }],
+        content: [{ type: 'text', text: `Exported project "${proj.name}" (${manifest.clips.length} clips).` }],
         structuredContent: manifest,
       };
     }
   );
 
-  // 23-27. Native Audio File Input Tools (openai/fileParams)
+  // 24-28. Native Audio File Input Tools (openai/fileParams)
   server.registerTool(
     'transcribe_audio',
     {
@@ -1006,12 +1183,16 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const { buffer, mimeType } = await resolveInputAudioBuffer(args);
-      const transcript = await transcribeAudioBuffer(buffer, mimeType);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ transcript }, null, 2) }],
-        structuredContent: { transcript },
-      };
+      try {
+        const { buffer, mimeType } = await resolveInputAudioBuffer(args);
+        const transcript = await transcribeAudioBuffer(buffer, mimeType);
+        return {
+          content: [{ type: 'text', text: transcript }],
+          structuredContent: { transcript },
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
@@ -1030,12 +1211,21 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const { buffer, mimeType } = await resolveInputAudioBuffer(args);
-      const analysis = await analyzeVoiceBuffer(buffer, mimeType);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(analysis, null, 2) }],
-        structuredContent: analysis,
-      };
+      try {
+        const { buffer, mimeType } = await resolveInputAudioBuffer(args);
+        const analysis = await analyzeVoiceBuffer(buffer, mimeType);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${analysis.voiceDescription} · Recommended preset: ${analysis.recommendedVoiceId} (~${analysis.estimatedWpm} WPM).`,
+            },
+          ],
+          structuredContent: analysis,
+        };
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
@@ -1057,19 +1247,23 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const { buffer, mimeType, sourceText } = await resolveInputAudioBuffer(args);
-      const transcript = sourceText || (await transcribeAudioBuffer(buffer, mimeType));
-      const [localized] = await localizeNarration({
-        text: transcript,
-        targetLanguages: [args.targetLanguage],
-        voiceId: args.voiceId,
-        preserveDuration: args.preserveDuration,
-      });
-      return buildAudioToolResult(publicBaseUrl, localized.result, {
-        sourceTranscript: transcript,
-        localizedScript: localized.script,
-        srt: localized.srt,
-      });
+      try {
+        const { buffer, mimeType, sourceText } = await resolveInputAudioBuffer(args);
+        const transcript = sourceText || (await transcribeAudioBuffer(buffer, mimeType));
+        const [localized] = await localizeNarration({
+          text: transcript,
+          targetLanguages: [args.targetLanguage],
+          voiceId: args.voiceId,
+          preserveDuration: args.preserveDuration,
+        });
+        return buildAudioToolResult(publicBaseUrl, localized.result, {
+          sourceTranscript: transcript,
+          localizedScript: localized.script,
+          srt: localized.srt,
+        });
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
@@ -1091,15 +1285,19 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const { buffer, sourceText } = await resolveInputAudioBuffer(args);
-      const res = await matchAudioDuration({
-        buffer,
-        targetDurationSeconds: args.targetDurationSeconds,
-        sampleRate: args.sampleRate,
-        channels: args.channels,
-        sourceText,
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const { buffer, sourceText } = await resolveInputAudioBuffer(args);
+        const res = await matchAudioDuration({
+          buffer,
+          targetDurationSeconds: args.targetDurationSeconds,
+          sampleRate: args.sampleRate,
+          channels: args.channels,
+          sourceText,
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
@@ -1123,16 +1321,20 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       },
     },
     async (args) => {
-      const { buffer } = await resolveInputAudioBuffer(args);
-      const res = await replaceAudioSegmentFromBuffer({
-        buffer,
-        startMs: args.startMs,
-        endMs: args.endMs,
-        replacementText: args.replacementText,
-        voiceId: args.voiceId,
-        language: args.language,
-      });
-      return buildAudioToolResult(publicBaseUrl, res);
+      try {
+        const { buffer } = await resolveInputAudioBuffer(args);
+        const res = await replaceAudioSegmentFromBuffer({
+          buffer,
+          startMs: args.startMs,
+          endMs: args.endMs,
+          replacementText: args.replacementText,
+          voiceId: args.voiceId,
+          language: args.language,
+        });
+        return buildAudioToolResult(publicBaseUrl, res);
+      } catch (error) {
+        return handleMcpToolError(error);
+      }
     }
   );
 
