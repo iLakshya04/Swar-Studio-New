@@ -174,6 +174,7 @@ export interface GenerateResponsePayload {
   wordTimings?: WordTiming[];
   phraseTimings?: PhraseTiming[];
   speechEnvelope?: SpeechEnvelopeInterval[];
+  waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];
   stems?: Array<{ speaker: string; clipId: string; audioUrl: string; durationMs: number }>;
   appliedPronunciations?: string[];
@@ -247,6 +248,7 @@ export interface HistoryItem {
   durationMs?: number;
   audioBase64: string;
   wordTimings?: WordTiming[];
+  waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];
   dialogueLines?: DialogueLine[];
   speakers?: {

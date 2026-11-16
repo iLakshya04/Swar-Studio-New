@@ -391,6 +391,34 @@ export function extractSpeechEnvelope(
   return intervals;
 }
 
+export function extractWaveformPeaks(
+  pcm: Int16Array,
+  channels = 1,
+  bucketCount = 120
+): number[] {
+  const mono = channels > 1 ? toMonoPcm(pcm, channels) : pcm;
+  if (mono.length === 0 || bucketCount <= 0) return [];
+  const count = Math.max(8, Math.min(240, Math.round(bucketCount)));
+  const bucketSize = Math.max(1, Math.floor(mono.length / count));
+  const rawPeaks: number[] = [];
+  let maxPeak = 0;
+
+  for (let b = 0; b < count; b += 1) {
+    const start = Math.min(mono.length - 1, Math.floor((b * mono.length) / count));
+    const end = Math.min(mono.length, Math.max(start + 1, Math.floor(((b + 1) * mono.length) / count), start + bucketSize));
+    let peak = 0;
+    for (let i = start; i < end; i += 1) {
+      const abs = Math.abs(mono[i]);
+      if (abs > peak) peak = abs;
+    }
+    rawPeaks.push(peak);
+    if (peak > maxPeak) maxPeak = peak;
+  }
+
+  const divisor = maxPeak > 64 ? maxPeak : 32767;
+  return rawPeaks.map((p) => Number(Math.max(0.04, Math.min(1, p / divisor)).toFixed(3)));
+}
+
 export interface ProcessAudioOptions {
   targetSampleRate?: SampleRateHz;
   targetChannels?: ChannelCount;
@@ -408,6 +436,7 @@ export interface ProcessedWavResult {
   channels: ChannelCount;
   durationMs: number;
   speechEnvelope: SpeechEnvelopeInterval[];
+  waveformPeaks: number[];
 }
 
 export function processWavAudio(
@@ -465,6 +494,7 @@ export function processWavAudio(
   const wavBuffer = encodeWavBuffer(finalPcm, targetRate, targetChannels);
   const durationMs = Math.round((mono.length / targetRate) * 1000);
   const speechEnvelope = extractSpeechEnvelope(mono, targetRate, 1, 25);
+  const waveformPeaks = extractWaveformPeaks(mono, 1, 120);
 
   return {
     wavBuffer,
@@ -472,6 +502,7 @@ export function processWavAudio(
     channels: targetChannels,
     durationMs,
     speechEnvelope,
+    waveformPeaks,
   };
 }
 
@@ -485,6 +516,7 @@ export function stitchWavBuffers(
   durationMs: number;
   offsetsMs: Array<{ startMs: number; endMs: number }>;
   speechEnvelope: SpeechEnvelopeInterval[];
+  waveformPeaks: number[];
 } {
   const gapSamples = Math.max(0, Math.round((gapMs / 1000) * targetRate));
   const monoSegments: Int16Array[] = [];
@@ -523,8 +555,9 @@ export function stitchWavBuffers(
   const wavBuffer = encodeWavBuffer(finalPcm, targetRate, targetChannels);
   const durationMs = Math.round((normalized.length / targetRate) * 1000);
   const speechEnvelope = extractSpeechEnvelope(normalized, targetRate, 1, 25);
+  const waveformPeaks = extractWaveformPeaks(normalized, 1, 120);
 
-  return { wavBuffer, durationMs, offsetsMs, speechEnvelope };
+  return { wavBuffer, durationMs, offsetsMs, speechEnvelope, waveformPeaks };
 }
 
 export function getAudioMimeType(format: AudioFormat): string {

@@ -44,6 +44,8 @@ import {
   insertVocalTagAtCursor,
 } from '../utils/speechLogic';
 import { generateSubtitles } from '../utils/subtitleGenerator';
+import type { ActiveTrack } from './AudioPlayerBar';
+import { InteractiveWaveform } from './InteractiveWaveform';
 import { VoiceAvatar } from './VoiceAvatar';
 
 interface SpeechStudioProps {
@@ -90,6 +92,13 @@ interface SpeechStudioProps {
   dialogueLines: DialogueLine[];
   onDialogueLinesChange: (lines: DialogueLine[]) => void;
   latestResult: GenerateResponsePayload | null;
+  activeTrack: ActiveTrack | null;
+  playbackCurrentTime: number;
+  playbackDuration: number;
+  isPlaying: boolean;
+  hasAudio: boolean;
+  onTogglePlay: () => void;
+  onSeek: (seconds: number, autoPlay?: boolean) => void;
   regeneratingSegIdx: number | null;
   onRegenerateSegment: (segmentIndex: number, nextText: string) => Promise<void> | void;
   isGenerating: boolean;
@@ -142,6 +151,13 @@ export function SpeechStudio({
   dialogueLines,
   onDialogueLinesChange,
   latestResult,
+  activeTrack,
+  playbackCurrentTime,
+  playbackDuration,
+  isPlaying,
+  hasAudio,
+  onTogglePlay,
+  onSeek,
   regeneratingSegIdx,
   onRegenerateSegment,
   isGenerating,
@@ -458,10 +474,9 @@ export function SpeechStudio({
                   ref={textareaRef}
                   value={text}
                   onChange={(e) => onTextChange(e.target.value)}
-                  rows={10}
-                  maxLength={8000}
+                  rows={7}
                   placeholder="Type or paste your script in English, हिन्दी (Hindi Devanagari), or Hinglish. Insert vocal tags like <breath> or emotion cues like [CURIOUS] or [AWE]..."
-                  className="w-full resize-y min-h-[250px] text-[16px] leading-[1.7] text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 bg-transparent focus:outline-none"
+                  className="w-full resize-y min-h-[168px] text-[16px] leading-[1.7] text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 bg-transparent focus:outline-none"
                 />
               </div>
             ) : (
@@ -542,11 +557,17 @@ export function SpeechStudio({
 
             <div className="px-5 py-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-4 bg-slate-50/50 dark:bg-slate-950/40 rounded-b-xl">
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                <span>{stats.chars} / 8,000 chars</span>
+                <span>{stats.chars.toLocaleString()} chars</span>
                 <span aria-hidden="true">·</span>
-                <span>{stats.words} words</span>
+                <span>{stats.words.toLocaleString()} words</span>
                 <span aria-hidden="true">·</span>
                 <span>~{stats.estimatedSeconds}s est.</span>
+                {mode === 'single' && stats.chars > 3500 && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span>Auto-chunked synthesis</span>
+                  </>
+                )}
                 <span aria-hidden="true">·</span>
                 <span>
                   Detected:{' '}
@@ -578,6 +599,38 @@ export function SpeechStudio({
               </button>
             </div>
           </section>
+
+          {/* Interactive Waveform & Word-Timing Offset Inspector */}
+          {(latestResult || activeTrack) &&
+          ((activeTrack?.wordTimings?.length ?? latestResult?.wordTimings?.length ?? 0) > 0 ||
+            (activeTrack?.waveformPeaks?.length ?? latestResult?.waveformPeaks?.length ?? 0) > 0) ? (
+            <InteractiveWaveform
+              title={activeTrack?.title}
+              wordTimings={
+                activeTrack?.wordTimings?.length
+                  ? activeTrack.wordTimings
+                  : latestResult?.wordTimings ?? []
+              }
+              waveformPeaks={
+                activeTrack?.waveformPeaks?.length
+                  ? activeTrack.waveformPeaks
+                  : latestResult?.waveformPeaks
+              }
+              durationSec={
+                playbackDuration > 0
+                  ? playbackDuration
+                  : activeTrack?.durationSec ||
+                    (latestResult?.durationMs
+                      ? latestResult.durationMs / 1000
+                      : latestResult?.durationEstimateSec || 0)
+              }
+              currentTime={playbackCurrentTime}
+              isPlaying={isPlaying}
+              hasAudio={hasAudio}
+              onTogglePlay={onTogglePlay}
+              onSeek={onSeek}
+            />
+          ) : null}
 
           {/* Captions & Segment Timeline Panel (visible once a clip with wordTimings is generated) */}
           {latestResult && (latestResult.wordTimings?.length || latestResult.segments?.length) ? (
@@ -1197,7 +1250,7 @@ export function SpeechStudio({
                     id="target-duration-input"
                     type="number"
                     min={1}
-                    max={180}
+                    max={1800}
                     step={0.5}
                     value={targetDurationSec}
                     onChange={(e) => onTargetDurationSecChange(e.target.value)}
@@ -1221,13 +1274,12 @@ export function SpeechStudio({
                 <select
                   id="engine-tier-select"
                   aria-label="Synthesis Engine"
-                  value={mode === 'multi' ? 'expressive' : engineTier}
-                  disabled={mode === 'multi'}
+                  value={engineTier}
                   onChange={(e) => onEngineTierChange(e.target.value as EngineTier)}
                   className="h-7 px-2 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-[11px] text-[#0F172A] dark:text-slate-100 focus:outline-none focus:border-[#2563EB]"
                 >
+                  <option value="standard">Flash Lite (High Quota)</option>
                   <option value="expressive">Flash Expressive</option>
-                  <option value="standard">Flash Lite (Fast)</option>
                 </select>
               </div>
             </div>

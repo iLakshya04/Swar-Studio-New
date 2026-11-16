@@ -11,6 +11,7 @@ import {
   applyMasteringPresetMono,
   encodeWavBuffer,
   extractSpeechEnvelope,
+  extractWaveformPeaks,
   normalizeMonoPcm,
   parseWavBuffer,
   processWavAudio,
@@ -19,7 +20,9 @@ import {
   timeStretchMonoPcm,
   trimSilenceMono,
 } from '../server/wavAudio';
-import type { PronunciationEntry } from '../types';
+import { selectTtsModel, splitLongScriptIntoChunks } from './speechLogic';
+import { generate, normalizeWordTimings } from './generateClient';
+import type { GenerateRequestPayload, PronunciationEntry } from '../types';
 
 function makeSineWav(sampleRate: number, durationSec: number, freqHz = 220, amp = 8000): Buffer {
   const totalSamples = Math.round(sampleRate * durationSec);
@@ -198,4 +201,75 @@ test('wavAudio pipeline parses, trims silence, resamples 24kHz->48kHz, normalize
 
   const env = extractSpeechEnvelope(upsampled, 48000, 1, 25);
   assert.ok(env.length > 10);
+
+  const peaks = extractWaveformPeaks(upsampled, 1, 80);
+  assert.equal(peaks.length, 80);
+  assert.ok(peaks.every((p) => p >= 0.04 && p <= 1));
 });
+
+test('splitLongScriptIntoChunks splits >10,000 char scripts cleanly and keeps bracket cues on high-quota standard model', () => {
+  const paragraph = 'This lightning shoots upward into the stratosphere. '.repeat(45);
+  const longScript = [paragraph, paragraph, paragraph, paragraph, paragraph].join('\n\n');
+  assert.ok(longScript.length > 10000);
+
+  const chunks = splitLongScriptIntoChunks(longScript, 3500);
+  assert.ok(chunks.length >= 3);
+  assert.ok(chunks.every((c) => c.length <= 3500 && c.length > 0));
+
+  const standardBracketModel = selectTtsModel({
+    mode: 'single',
+    modelTier: 'standard',
+    text: '[CURIOUS] Why does lightning shoot upward above thunderclouds?',
+  });
+  assert.equal(standardBracketModel, 'gemini-3.8-flash-lite-tts');
+});
+
+test('generate utility normalizes word-level start/end offsets and waveformPeaks from GenerateResponsePayload', async () => {
+  const mockPayload: GenerateRequestPayload = {
+    mode: 'single',
+    language: 'en',
+    modelTier: 'standard',
+    text: 'This lightning shoots upward.',
+    voiceName: 'Charon',
+    stylePrompt: 'Curious narrator',
+    speed: 1.0,
+  };
+
+  const fakeFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({
+        clipId: 'clip_test_1',
+        audioBase64: 'UklGRg==',
+        mimeType: 'audio/wav',
+        modelUsed: 'gemini-3.8-flash-lite-tts',
+        durationEstimateSec: 1.4,
+        durationMs: 1400,
+        wordTimings: [
+          { word: 'This', startMs: 0, endMs: 220 },
+          { word: 'lightning', startMs: 240, endMs: 650 },
+          { word: 'shoots', startMs: 670, endMs: 960 },
+          { word: 'upward.', startMs: 980, endMs: 1380 },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+
+  const result = await generate(mockPayload, fakeFetch);
+  assert.equal(result.modelUsed, 'gemini-3.8-flash-lite-tts');
+  assert.equal(result.wordTimings?.length, 4);
+  assert.deepEqual(result.wordTimings?.[1], {
+    word: 'lightning',
+    startMs: 240,
+    endMs: 650,
+    startSeconds: 0.24,
+    endSeconds: 0.65,
+  });
+  assert.ok(Array.isArray(result.waveformPeaks) && result.waveformPeaks.length === 120);
+
+  const directNormalized = normalizeWordTimings([
+    { word: 'Hello', startMs: 100, endMs: 420, startSeconds: 0.1, endSeconds: 0.42 },
+  ]);
+  assert.equal(directNormalized[0].startSeconds, 0.1);
+  assert.equal(directNormalized[0].endSeconds, 0.42);
+});
+

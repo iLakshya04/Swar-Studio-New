@@ -636,6 +636,7 @@ function splitScriptIntoSegments(script) {
   const rawBlocks = normalized.split(/\n+/).map((b) => b.trim()).filter(Boolean);
   const segments = [];
   let currentEmotion;
+  let pendingInlinePrefix = "";
   for (const block of rawBlocks) {
     const subParts = block.split(/(?=(?:\[[A-Z_]{2,24}\]))|(?<=[.!?।])\s+(?=[A-Z0-9\u0900-\u097F"<|\[])/u).map((s) => s.trim()).filter(Boolean);
     for (const part of subParts) {
@@ -647,14 +648,24 @@ function splitScriptIntoSegments(script) {
       }
       if (!working) continue;
       const displayText = working.replace(/<[^>]+>/g, " ").replace(/\|[^|]+\|/g, " ").replace(/\s+/g, " ").trim();
+      if (!displayText) {
+        pendingInlinePrefix = pendingInlinePrefix ? `${pendingInlinePrefix} ${working}` : working;
+        continue;
+      }
+      const rawText = pendingInlinePrefix ? `${pendingInlinePrefix} ${working}` : working;
+      pendingInlinePrefix = "";
       segments.push({
         index: segments.length,
         emotion: currentEmotion,
         emotionPrompt: getEmotionStyleHint(currentEmotion),
-        displayText: displayText || working,
-        rawText: working
+        displayText,
+        rawText
       });
     }
+  }
+  if (pendingInlinePrefix && segments.length > 0) {
+    const last = segments[segments.length - 1];
+    last.rawText = `${last.rawText} ${pendingInlinePrefix}`.trim();
   }
   return segments;
 }
@@ -697,7 +708,7 @@ function applyPronunciationRules(text, rules, targetLanguage) {
 }
 
 // src/utils/speechLogic.ts
-var VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\||\[[A-Z_]{2,24}\])/i;
+var VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\|)/i;
 function countWordsAndChars(text) {
   const chars = text.length;
   const plainText = text.replace(/\[[A-Z_]{2,24}\]/g, " ").replace(/<[^>]+>/g, " ").replace(/\|[^|]+\|/g, " ").trim();
@@ -830,6 +841,55 @@ function buildStyleInstruction(params) {
   }
   return parts.join(". ");
 }
+function splitLongScriptIntoChunks(text, maxChunkChars = 3500) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  if (trimmed.length <= maxChunkChars) return [trimmed];
+  const paragraphs = trimmed.split(/\n+/).map((p) => p.trim()).filter(Boolean);
+  const chunks = [];
+  let current = "";
+  const pushSentencewise = (block) => {
+    const sentences = block.split(/(?<=[.!?।])\s+/u).map((s) => s.trim()).filter(Boolean);
+    for (const sentence of sentences) {
+      if (sentence.length > maxChunkChars) {
+        for (let i = 0; i < sentence.length; i += maxChunkChars) {
+          const slice = sentence.slice(i, i + maxChunkChars).trim();
+          if (slice) {
+            if (current) {
+              chunks.push(current);
+              current = "";
+            }
+            chunks.push(slice);
+          }
+        }
+        continue;
+      }
+      const next = current ? `${current} ${sentence}` : sentence;
+      if (next.length <= maxChunkChars) {
+        current = next;
+      } else {
+        if (current) chunks.push(current);
+        current = sentence;
+      }
+    }
+  };
+  for (const para of paragraphs) {
+    const candidate = current ? `${current}
+${para}` : para;
+    if (candidate.length <= maxChunkChars) {
+      current = candidate;
+    } else if (para.length <= maxChunkChars) {
+      if (current) chunks.push(current);
+      current = para;
+    } else {
+      pushSentencewise(para);
+    }
+  }
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
+}
 function validateGeneratePayload(payload) {
   if (payload.mode === "multi") {
     const lines = payload.dialogueLines ?? [];
@@ -838,13 +898,6 @@ function validateGeneratePayload(payload) {
       return {
         valid: false,
         error: "Enter at least one non-empty dialogue line before generating audio."
-      };
-    }
-    const totalLength = nonEmptyLines.reduce((acc, line) => acc + line.text.length, 0);
-    if (totalLength > 8e3) {
-      return {
-        valid: false,
-        error: "Dialogue script exceeds the 8,000-character limit."
       };
     }
     if ((!payload.speakerList || payload.speakerList.length === 0) && (!payload.speakers?.A?.name?.trim() || !payload.speakers?.B?.name?.trim())) {
@@ -860,12 +913,6 @@ function validateGeneratePayload(payload) {
     return {
       valid: false,
       error: "Enter a script in English or Hindi before generating speech."
-    };
-  }
-  if (text.length > 8e3) {
-    return {
-      valid: false,
-      error: "Script exceeds the 8,000-character limit."
     };
   }
   return { valid: true };
@@ -1395,6 +1442,27 @@ function extractSpeechEnvelope(pcm, sampleRate, channels = 1, frameMs = 25) {
   }
   return intervals;
 }
+function extractWaveformPeaks(pcm, channels = 1, bucketCount = 120) {
+  const mono = channels > 1 ? toMonoPcm(pcm, channels) : pcm;
+  if (mono.length === 0 || bucketCount <= 0) return [];
+  const count = Math.max(8, Math.min(240, Math.round(bucketCount)));
+  const bucketSize = Math.max(1, Math.floor(mono.length / count));
+  const rawPeaks = [];
+  let maxPeak = 0;
+  for (let b = 0; b < count; b += 1) {
+    const start = Math.min(mono.length - 1, Math.floor(b * mono.length / count));
+    const end = Math.min(mono.length, Math.max(start + 1, Math.floor((b + 1) * mono.length / count), start + bucketSize));
+    let peak = 0;
+    for (let i = start; i < end; i += 1) {
+      const abs = Math.abs(mono[i]);
+      if (abs > peak) peak = abs;
+    }
+    rawPeaks.push(peak);
+    if (peak > maxPeak) maxPeak = peak;
+  }
+  const divisor = maxPeak > 64 ? maxPeak : 32767;
+  return rawPeaks.map((p) => Number(Math.max(0.04, Math.min(1, p / divisor)).toFixed(3)));
+}
 function processWavAudio(rawWavBuffer, options = {}) {
   const parsed = parseWavBuffer(rawWavBuffer);
   let mono = toMonoPcm(parsed.pcm, parsed.channels);
@@ -1436,12 +1504,14 @@ function processWavAudio(rawWavBuffer, options = {}) {
   const wavBuffer = encodeWavBuffer(finalPcm, targetRate, targetChannels);
   const durationMs = Math.round(mono.length / targetRate * 1e3);
   const speechEnvelope = extractSpeechEnvelope(mono, targetRate, 1, 25);
+  const waveformPeaks = extractWaveformPeaks(mono, 1, 120);
   return {
     wavBuffer,
     sampleRate: targetRate,
     channels: targetChannels,
     durationMs,
-    speechEnvelope
+    speechEnvelope,
+    waveformPeaks
   };
 }
 function stitchWavBuffers(wavBuffers, gapMs = 160, targetRate = 48e3, targetChannels = 1) {
@@ -1479,7 +1549,8 @@ function stitchWavBuffers(wavBuffers, gapMs = 160, targetRate = 48e3, targetChan
   const wavBuffer = encodeWavBuffer(finalPcm, targetRate, targetChannels);
   const durationMs = Math.round(normalized.length / targetRate * 1e3);
   const speechEnvelope = extractSpeechEnvelope(normalized, targetRate, 1, 25);
-  return { wavBuffer, durationMs, offsetsMs, speechEnvelope };
+  const waveformPeaks = extractWaveformPeaks(normalized, 1, 120);
+  return { wavBuffer, durationMs, offsetsMs, speechEnvelope, waveformPeaks };
 }
 function getAudioMimeType(format) {
   switch (format) {
@@ -1558,10 +1629,15 @@ function mapApiError(error) {
   if (status === 429 || rawMessage.includes("RESOURCE_EXHAUSTED")) {
     return {
       status: 429,
-      message: "Rate limit reached on the Gemini API. Please wait a moment and try again."
+      message: "Gemini TTS API quota exhausted on the current free-tier key. Select a billing-enabled API key in Settings > Secrets to lift free-tier daily caps."
     };
   }
   return { status: status >= 400 && status < 600 ? status : 500, message: rawMessage };
+}
+function isQuotaOrRateError(err) {
+  const msg = String(err?.message || "");
+  const status = err?.status;
+  return status === 429 || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429");
 }
 async function callSingleSpeakerGeminiTts(params) {
   const config = {
@@ -1575,8 +1651,8 @@ async function callSingleSpeakerGeminiTts(params) {
   if (typeof params.seed === "number" && Number.isFinite(params.seed)) {
     config.seed = Math.round(params.seed);
   }
-  const response = await params.ai.models.generateContent({
-    model: params.model,
+  const invokeModel = (targetModel) => params.ai.models.generateContent({
+    model: targetModel,
     contents: [
       {
         role: "user",
@@ -1592,6 +1668,23 @@ async function callSingleSpeakerGeminiTts(params) {
     ],
     config
   });
+  let response;
+  let actualModel = params.model;
+  try {
+    response = await invokeModel(params.model);
+  } catch (err) {
+    if (isQuotaOrRateError(err)) {
+      if (params.model === "gemini-3.8-flash-tts") {
+        actualModel = "gemini-3.8-flash-lite-tts";
+        response = await invokeModel("gemini-3.8-flash-lite-tts");
+      } else {
+        await new Promise((r) => setTimeout(r, 1400));
+        response = await invokeModel(params.model);
+      }
+    } else {
+      throw err;
+    }
+  }
   const parts = response.candidates?.[0]?.content?.parts ?? [];
   const audioPart = parts.find((p) => p.inlineData?.data);
   const base64Audio = audioPart?.inlineData?.data;
@@ -1602,7 +1695,7 @@ async function callSingleSpeakerGeminiTts(params) {
     err.status = 502;
     throw err;
   }
-  return Buffer.from(base64Audio, "base64");
+  return { buffer: Buffer.from(base64Audio, "base64"), actualModel };
 }
 async function synthesizeSpeech(payload) {
   const validation = validateGeneratePayload(payload);
@@ -1629,7 +1722,7 @@ async function synthesizeSpeech(payload) {
   const voiceId = resolvedVoicePreset.id;
   const voiceName = payload.voiceName || resolvedVoicePreset.baseVoice;
   const voiceDisplayName = payload.customVoiceDescription?.trim() ? `Custom (${voiceName})` : `${resolvedVoicePreset.name} (${resolvedVoicePreset.roleTitle})`;
-  const modelUsed = selectTtsModel({
+  let actualModelUsed = selectTtsModel({
     mode,
     modelTier,
     text: payload.text || "",
@@ -1696,32 +1789,66 @@ async function synthesizeSpeech(payload) {
           }
         };
       });
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash-tts",
-        contents: [{ role: "user", parts }],
-        config: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            multiSpeakerVoiceConfig: {
-              speakerVoiceConfigs: [
-                {
-                  speaker: spA.name,
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || "Puck" } }
-                },
-                {
-                  speaker: spB.name,
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || "Kore" } }
-                }
-              ]
+      try {
+        const response = await ai.models.generateContent({
+          model: "gemini-3.8-flash-tts",
+          contents: [{ role: "user", parts }],
+          config: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              multiSpeakerVoiceConfig: {
+                speakerVoiceConfigs: [
+                  {
+                    speaker: spA.name,
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || "Puck" } }
+                  },
+                  {
+                    speaker: spB.name,
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || "Kore" } }
+                  }
+                ]
+              }
             }
           }
+        });
+        const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
+        if (!audioPart?.inlineData?.data) {
+          throw new Error("Multi-speaker synthesis returned empty audio.");
         }
-      });
-      const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
-      if (!audioPart?.inlineData?.data) {
-        throw new Error("Multi-speaker synthesis returned empty audio.");
+        rawMasterWav = Buffer.from(audioPart.inlineData.data, "base64");
+        actualModelUsed = "gemini-3.8-flash-tts";
+      } catch (err) {
+        if (!isQuotaOrRateError(err)) {
+          throw err;
+        }
+        const fallbackBuffers = [];
+        for (const line of nonEmptyLines) {
+          const speaker = line.speakerKey === keyA ? spA : spB;
+          const pron = applyPronunciationRules(line.text.trim(), activePronunciations, language);
+          const speakerStyle = buildStyleInstruction({
+            language,
+            stylePrompt: speaker.style || "Natural conversational dialogue",
+            speed,
+            pitchRegister,
+            emotionIntensity,
+            expressiveControls: payload.expressiveControls,
+            pronunciationPrompt: pron.pronunciationPrompt,
+            emotionHint: getEmotionStyleHint(line.emotion)
+          });
+          const resTurn = await callSingleSpeakerGeminiTts({
+            ai,
+            model: "gemini-3.8-flash-lite-tts",
+            text: pron.ttsText,
+            voiceName: speaker.baseVoice || "Puck",
+            styleInstruction: speakerStyle,
+            seed: payload.seed
+          });
+          fallbackBuffers.push(resTurn.buffer);
+          actualModelUsed = resTurn.actualModel;
+        }
+        const stitched = stitchWavBuffers(fallbackBuffers, 140, targetSampleRate, targetChannels);
+        rawMasterWav = stitched.wavBuffer;
       }
-      rawMasterWav = Buffer.from(audioPart.inlineData.data, "base64");
     } else {
       const lineBuffers = [];
       const speakerBuckets = /* @__PURE__ */ new Map();
@@ -1744,17 +1871,18 @@ async function synthesizeSpeech(payload) {
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: getEmotionStyleHint(line.emotion)
         });
-        const buf = await callSingleSpeakerGeminiTts({
+        const turnResult = await callSingleSpeakerGeminiTts({
           ai,
-          model: "gemini-3.8-flash-tts",
+          model: actualModelUsed,
           text: pron.ttsText,
           voiceName: sp.baseVoice || "Puck",
           styleInstruction,
           seed: payload.seed
         });
-        lineBuffers.push(buf);
+        actualModelUsed = turnResult.actualModel;
+        lineBuffers.push(turnResult.buffer);
         const list = speakerBuckets.get(sp.name) ?? [];
-        list.push(buf);
+        list.push(turnResult.buffer);
         speakerBuckets.set(sp.name, list);
       }
       const stitched = stitchWavBuffers(lineBuffers, 150, targetSampleRate, targetChannels);
@@ -1772,7 +1900,7 @@ async function synthesizeSpeech(payload) {
             durationMs: stemStitched.durationMs,
             voiceId,
             voiceName: speakerName,
-            modelUsed: "gemini-3.8-flash-tts",
+            modelUsed: actualModelUsed,
             language,
             displayText: `${speakerName} stem`,
             masteringPreset,
@@ -1812,15 +1940,16 @@ async function synthesizeSpeech(payload) {
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: seg.emotionPrompt
         });
-        const segWav = await callSingleSpeakerGeminiTts({
+        const segRes = await callSingleSpeakerGeminiTts({
           ai,
-          model: "gemini-3.8-flash-tts",
+          model: actualModelUsed,
           text: pron.ttsText,
           voiceName,
           styleInstruction: segStyle,
           seed: payload.seed
         });
-        const processedSeg = processWavAudio(segWav, {
+        actualModelUsed = segRes.actualModel;
+        const processedSeg = processWavAudio(segRes.buffer, {
           targetSampleRate,
           targetChannels,
           trimSilence: true,
@@ -1853,7 +1982,7 @@ async function synthesizeSpeech(payload) {
           durationMs: info.durationMs,
           voiceId,
           voiceName: voiceDisplayName,
-          modelUsed: "gemini-3.8-flash-tts",
+          modelUsed: actualModelUsed,
           language,
           displayText: info.seg.displayText,
           masteringPreset,
@@ -1901,14 +2030,34 @@ async function synthesizeSpeech(payload) {
         pronunciationPrompt: pron.pronunciationPrompt,
         emotionHint: singleEmotion
       });
-      rawMasterWav = await callSingleSpeakerGeminiTts({
-        ai,
-        model: modelUsed,
-        text: cleanTtsText || pron.ttsText,
-        voiceName,
-        styleInstruction,
-        seed: payload.seed
-      });
+      const chunks = splitLongScriptIntoChunks(cleanTtsText || pron.ttsText, 3500);
+      if (chunks.length <= 1) {
+        const singleRes = await callSingleSpeakerGeminiTts({
+          ai,
+          model: actualModelUsed,
+          text: chunks[0] || cleanTtsText || pron.ttsText,
+          voiceName,
+          styleInstruction,
+          seed: payload.seed
+        });
+        rawMasterWav = singleRes.buffer;
+        actualModelUsed = singleRes.actualModel;
+      } else {
+        const chunkWavs = [];
+        for (const chunkText of chunks) {
+          const chunkRes = await callSingleSpeakerGeminiTts({
+            ai,
+            model: actualModelUsed,
+            text: chunkText,
+            voiceName,
+            styleInstruction,
+            seed: payload.seed
+          });
+          actualModelUsed = chunkRes.actualModel;
+          chunkWavs.push(chunkRes.buffer);
+        }
+        rawMasterWav = stitchWavBuffers(chunkWavs, 150, targetSampleRate, targetChannels).wavBuffer;
+      }
     }
   }
   const processed = processWavAudio(rawMasterWav, {
@@ -1944,7 +2093,7 @@ async function synthesizeSpeech(payload) {
     durationMs: processed.durationMs,
     voiceId,
     voiceName: voiceDisplayName,
-    modelUsed,
+    modelUsed: actualModelUsed,
     language,
     displayText: displayTextForCaptions,
     masteringPreset,
@@ -1980,7 +2129,7 @@ async function synthesizeSpeech(payload) {
     sampleRate: processed.sampleRate,
     channels: processed.channels,
     sizeBytes: encoded.buffer.length,
-    modelUsed,
+    modelUsed: actualModelUsed,
     voiceId,
     voiceName: voiceDisplayName,
     durationEstimateSec: Math.max(1, Math.round(processed.durationMs / 1e3)),
@@ -1988,6 +2137,7 @@ async function synthesizeSpeech(payload) {
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks,
     segments: segmentsMeta,
     stems: stemsMeta,
     appliedPronunciations: Array.from(appliedPronunciations)
@@ -2015,14 +2165,15 @@ async function regenerateClipSegment(params) {
     emotionHint: getEmotionStyleHint(nextEmotion)
   });
   const ai = getGeminiClient();
-  const newRawWav = await callSingleSpeakerGeminiTts({
+  const preferredModel = existing.modelUsed === "gemini-3.8-flash-tts" ? "gemini-3.8-flash-tts" : "gemini-3.8-flash-lite-tts";
+  const segResult = await callSingleSpeakerGeminiTts({
     ai,
-    model: "gemini-3.8-flash-tts",
+    model: preferredModel,
     text: pron.ttsText,
     voiceName: voicePreset.baseVoice,
     styleInstruction
   });
-  const processedNewSeg = processWavAudio(newRawWav, {
+  const processedNewSeg = processWavAudio(segResult.buffer, {
     targetSampleRate: existing.sampleRate,
     targetChannels: existing.channels,
     trimSilence: true,
@@ -2045,7 +2196,7 @@ async function regenerateClipSegment(params) {
     durationMs: processedNewSeg.durationMs,
     voiceId: voicePreset.id,
     voiceName: `${voicePreset.name} (${voicePreset.roleTitle})`,
-    modelUsed: "gemini-3.8-flash-tts",
+    modelUsed: segResult.actualModel,
     language: existing.language,
     displayText: nextText,
     masteringPreset: existing.masteringPreset,
@@ -2112,7 +2263,7 @@ async function regenerateClipSegment(params) {
     durationMs: stitched.durationMs,
     voiceId: existing.voiceId,
     voiceName: existing.voiceName,
-    modelUsed: "gemini-3.8-flash-tts",
+    modelUsed: segResult.actualModel,
     language: existing.language,
     displayText: fullDisplayText,
     masteringPreset: existing.masteringPreset,
@@ -2139,6 +2290,7 @@ async function regenerateClipSegment(params) {
     wordTimings: combinedWords,
     phraseTimings: fullPhraseTimings,
     speechEnvelope: stitched.speechEnvelope,
+    waveformPeaks: stitched.waveformPeaks,
     segments: updatedSegments
   };
 }
@@ -2180,7 +2332,7 @@ async function localizeNarration(params) {
     const res = await synthesizeSpeech({
       mode: "single",
       language: lang,
-      modelTier: "expressive",
+      modelTier: "standard",
       text: localizedText,
       voiceId: vPreset.id,
       voiceName: vPreset.baseVoice,
@@ -2352,7 +2504,8 @@ async function matchAudioDuration(params) {
     durationMs: processed.durationMs,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
-    speechEnvelope: processed.speechEnvelope
+    speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks
   };
 }
 async function replaceAudioSegmentFromBuffer(params) {
@@ -2370,7 +2523,7 @@ async function replaceAudioSegmentFromBuffer(params) {
   const repRes = await synthesizeSpeech({
     mode: "single",
     language: params.language || "en",
-    modelTier: "expressive",
+    modelTier: "standard",
     text: params.replacementText,
     voiceId: preset.id,
     voiceName: preset.baseVoice,
@@ -2392,6 +2545,7 @@ async function replaceAudioSegmentFromBuffer(params) {
   const finalWav = encodeWavBuffer(toChannelCount(combined, ch), rate, ch);
   const durationMs = Math.round(combined.length / rate * 1e3);
   const speechEnvelope = extractSpeechEnvelope(combined, rate, 1, 25);
+  const waveformPeaks = extractWaveformPeaks(combined, 1, 120);
   const aligned = alignWordsToEnvelope(params.replacementText, durationMs, speechEnvelope);
   const saved = saveStoredClip({
     wavBuffer: finalWav,
@@ -2402,7 +2556,7 @@ async function replaceAudioSegmentFromBuffer(params) {
     durationMs,
     voiceId: preset.id,
     voiceName: `${preset.name} (${preset.roleTitle})`,
-    modelUsed: "gemini-3.8-flash-tts",
+    modelUsed: repRes.modelUsed,
     language: params.language || "en",
     displayText: params.replacementText,
     masteringPreset: "none",
@@ -2420,14 +2574,15 @@ async function replaceAudioSegmentFromBuffer(params) {
     sampleRate: rate,
     channels: ch,
     sizeBytes: finalWav.length,
-    modelUsed: "gemini-3.8-flash-tts",
+    modelUsed: repRes.modelUsed,
     voiceId: preset.id,
     voiceName: `${preset.name} (${preset.roleTitle})`,
     durationEstimateSec: Math.max(1, Math.round(durationMs / 1e3)),
     durationMs,
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
-    speechEnvelope
+    speechEnvelope,
+    waveformPeaks
   };
 }
 
@@ -2474,6 +2629,7 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
     wordTimings: res.wordTimings ?? [],
     phraseTimings: res.phraseTimings ?? [],
     speechEnvelope: res.speechEnvelope ?? [],
+    ...res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {},
     ...res.segments ? { segments: res.segments } : {},
     ...res.stems ? { stems: res.stems } : {},
     ...extraMeta
@@ -2658,7 +2814,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       const res = await synthesizeSpeech({
         mode: "single",
         language: preset.sampleLanguage,
-        modelTier: "expressive",
+        modelTier: "standard",
         text: sampleText?.trim() || preset.sampleText,
         voiceId: preset.id,
         voiceName: preset.baseVoice,
@@ -2678,7 +2834,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       title: "Generate Production Speech & Native Audio File",
       description: "Synthesize creator-ready speech in English, Hindi, or Hinglish. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, silence trimming, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native audio file output + word/phrase timestamps + speechEnvelope.",
       inputSchema: {
-        text: z.string().min(1).max(8e3),
+        text: z.string().min(1),
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe("Optional saved preset ID or name from list_voice_presets."),
         language: z.enum(["en", "hi", "bilingual"]).optional(),
@@ -2711,7 +2867,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       const res = await synthesizeSpeech({
         mode: "single",
         language,
-        modelTier: "expressive",
+        modelTier: args.expressiveControls || args.customVoiceDescription ? "expressive" : "standard",
         text: args.text,
         voiceId: preset.id,
         voiceName: preset.baseVoice,
@@ -2743,7 +2899,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       title: "Generate Timeline & Emotion-Tagged Speech Segments",
       description: "Synthesize a script split into sentences or per-line emotion tags ([CURIOUS], [CHALLENGING], [AWE], [QUIET]). Returns a stitched master WAV plus per-segment clipIds and timings so any single sentence can later be regenerated.",
       inputSchema: {
-        text: z.string().min(1).max(8e3),
+        text: z.string().min(1),
         voiceId: z.string().optional(),
         language: z.enum(["en", "hi", "bilingual"]).optional().default("en"),
         stylePrompt: z.string().optional(),
@@ -2758,7 +2914,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       const res = await synthesizeSpeech({
         mode: "single",
         language: args.language,
-        modelTier: "expressive",
+        modelTier: "standard",
         text: args.text,
         voiceId: preset.id,
         voiceName: preset.baseVoice,
@@ -2946,7 +3102,7 @@ function createSvaraMcpServer(publicBaseUrl) {
       const res = await synthesizeSpeech({
         mode: "multi",
         language: args.language,
-        modelTier: "expressive",
+        modelTier: "standard",
         text: "",
         voiceName: speakerList[0].baseVoice,
         stylePrompt: "",

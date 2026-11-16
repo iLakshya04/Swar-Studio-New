@@ -81,6 +81,7 @@ function buildAudioToolResult(
     wordTimings: res.wordTimings ?? [],
     phraseTimings: res.phraseTimings ?? [],
     speechEnvelope: res.speechEnvelope ?? [],
+    ...(res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {}),
     ...(res.segments ? { segments: res.segments } : {}),
     ...(res.stems ? { stems: res.stems } : {}),
     ...extraMeta,
@@ -329,7 +330,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       description:
         'Synthesize creator-ready speech in English, Hindi, or Hinglish. Supports 48 kHz WAV/MP3/M4A/FLAC, normalization, silence trimming, mastering presets, target duration fitting, saved voice presets, custom pronunciations, and returns native audio file output + word/phrase timestamps + speechEnvelope.',
       inputSchema: {
-        text: z.string().min(1).max(8000),
+        text: z.string().min(1),
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe('Optional saved preset ID or name from list_voice_presets.'),
         language: z.enum(['en', 'hi', 'bilingual']).optional(),
@@ -402,7 +403,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       description:
         'Synthesize a script split into sentences or per-line emotion tags ([CURIOUS], [CHALLENGING], [AWE], [QUIET]). Returns a stitched master WAV plus per-segment clipIds and timings so any single sentence can later be regenerated.',
       inputSchema: {
-        text: z.string().min(1).max(8000),
+        text: z.string().min(1),
         voiceId: z.string().optional(),
         language: z.enum(['en', 'hi', 'bilingual']).optional().default('en'),
         stylePrompt: z.string().optional(),
@@ -420,7 +421,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       const res = await synthesizeSpeech({
         mode: 'single',
         language: args.language,
-        modelTier: 'expressive',
+        modelTier: 'standard',
         text: args.text,
         voiceId: preset.id,
         voiceName: preset.baseVoice,
@@ -628,7 +629,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
       const res = await synthesizeSpeech({
         mode: 'multi',
         language: args.language,
-        modelTier: 'expressive',
+        modelTier: 'standard',
         text: '',
         voiceName: speakerList[0].baseVoice,
         stylePrompt: '',

@@ -11,6 +11,7 @@ import {
   clampSpeed,
   countWordsAndChars,
   selectTtsModel,
+  splitLongScriptIntoChunks,
   validateGeneratePayload,
 } from '../utils/speechLogic';
 import { alignWordsToEnvelope, generateSubtitles } from '../utils/subtitleGenerator';
@@ -37,6 +38,7 @@ import {
 import {
   encodeWavBuffer,
   extractSpeechEnvelope,
+  extractWaveformPeaks,
   parseWavBuffer,
   processWavAudio,
   resampleMonoPcm,
@@ -94,10 +96,17 @@ export function mapApiError(error: unknown): { status: number; message: string }
   if (status === 429 || rawMessage.includes('RESOURCE_EXHAUSTED')) {
     return {
       status: 429,
-      message: 'Rate limit reached on the Gemini API. Please wait a moment and try again.',
+      message:
+        'Gemini TTS API quota exhausted on the current free-tier key. Select a billing-enabled API key in Settings > Secrets to lift free-tier daily caps.',
     };
   }
   return { status: status >= 400 && status < 600 ? status : 500, message: rawMessage };
+}
+
+function isQuotaOrRateError(err: unknown): boolean {
+  const msg = String((err as { message?: string })?.message || '');
+  const status = (err as { status?: number })?.status;
+  return status === 429 || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429');
 }
 
 async function callSingleSpeakerGeminiTts(params: {
@@ -107,7 +116,7 @@ async function callSingleSpeakerGeminiTts(params: {
   voiceName: PrebuiltVoiceName;
   styleInstruction: string;
   seed?: number;
-}): Promise<Buffer> {
+}): Promise<{ buffer: Buffer; actualModel: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts' }> {
   const config: Record<string, unknown> = {
     responseModalities: ['AUDIO'],
     speechConfig: {
@@ -120,10 +129,9 @@ async function callSingleSpeakerGeminiTts(params: {
     config.seed = Math.round(params.seed);
   }
 
-  let response;
-  try {
-    response = await params.ai.models.generateContent({
-      model: params.model,
+  const invokeModel = (targetModel: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts') =>
+    params.ai.models.generateContent({
+      model: targetModel,
       contents: [
         {
           role: 'user',
@@ -139,30 +147,22 @@ async function callSingleSpeakerGeminiTts(params: {
       ],
       config,
     });
+
+  let response;
+  let actualModel: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts' = params.model;
+
+  try {
+    response = await invokeModel(params.model);
   } catch (err) {
-    const msg = String((err as { message?: string })?.message || '');
-    const status = (err as { status?: number })?.status;
-    if (
-      params.model === 'gemini-3.8-flash-tts' &&
-      (status === 429 || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429'))
-    ) {
-      response = await params.ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: params.text.trim(),
-                speechMetadata: {
-                  style: params.styleInstruction || 'Natural, clear voice delivery',
-                },
-              },
-            ],
-          },
-        ],
-        config,
-      });
+    if (isQuotaOrRateError(err)) {
+      if (params.model === 'gemini-3.8-flash-tts') {
+        actualModel = 'gemini-3.8-flash-lite-tts';
+        response = await invokeModel('gemini-3.8-flash-lite-tts');
+      } else {
+        // Brief backoff retry for transient RPM rate limits on flash-lite-tts
+        await new Promise((r) => setTimeout(r, 1400));
+        response = await invokeModel(params.model);
+      }
     } else {
       throw err;
     }
@@ -178,7 +178,7 @@ async function callSingleSpeakerGeminiTts(params: {
     err.status = 502;
     throw err;
   }
-  return Buffer.from(base64Audio, 'base64');
+  return { buffer: Buffer.from(base64Audio, 'base64'), actualModel };
 }
 
 export async function synthesizeSpeech(
@@ -224,7 +224,7 @@ export async function synthesizeSpeech(
     ? `Custom (${voiceName})`
     : `${resolvedVoicePreset.name} (${resolvedVoicePreset.roleTitle})`;
 
-  const modelUsed = selectTtsModel({
+  let actualModelUsed: string = selectTtsModel({
     mode,
     modelTier,
     text: payload.text || '',
@@ -301,33 +301,68 @@ export async function synthesizeSpeech(
         };
       });
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-tts',
-        contents: [{ role: 'user', parts }],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            multiSpeakerVoiceConfig: {
-              speakerVoiceConfigs: [
-                {
-                  speaker: spA.name,
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || 'Puck' } },
-                },
-                {
-                  speaker: spB.name,
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || 'Kore' } },
-                },
-              ],
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-tts',
+          contents: [{ role: 'user', parts }],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              multiSpeakerVoiceConfig: {
+                speakerVoiceConfigs: [
+                  {
+                    speaker: spA.name,
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spA.baseVoice || 'Puck' } },
+                  },
+                  {
+                    speaker: spB.name,
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: spB.baseVoice || 'Kore' } },
+                  },
+                ],
+              },
             },
           },
-        },
-      });
+        });
 
-      const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
-      if (!audioPart?.inlineData?.data) {
-        throw new Error('Multi-speaker synthesis returned empty audio.');
+        const audioPart = (response.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData?.data);
+        if (!audioPart?.inlineData?.data) {
+          throw new Error('Multi-speaker synthesis returned empty audio.');
+        }
+        rawMasterWav = Buffer.from(audioPart.inlineData.data, 'base64');
+        actualModelUsed = 'gemini-3.8-flash-tts';
+      } catch (err) {
+        if (!isQuotaOrRateError(err)) {
+          throw err;
+        }
+        // Fallback: synthesize each dialogue turn with flash-lite-tts and stitch
+        const fallbackBuffers: Buffer[] = [];
+        for (const line of nonEmptyLines) {
+          const speaker = line.speakerKey === keyA ? spA : spB;
+          const pron = applyPronunciationRules(line.text.trim(), activePronunciations, language);
+          const speakerStyle = buildStyleInstruction({
+            language,
+            stylePrompt: speaker.style || 'Natural conversational dialogue',
+            speed,
+            pitchRegister,
+            emotionIntensity,
+            expressiveControls: payload.expressiveControls,
+            pronunciationPrompt: pron.pronunciationPrompt,
+            emotionHint: getEmotionStyleHint(line.emotion),
+          });
+          const resTurn = await callSingleSpeakerGeminiTts({
+            ai,
+            model: 'gemini-3.8-flash-lite-tts',
+            text: pron.ttsText,
+            voiceName: speaker.baseVoice || 'Puck',
+            styleInstruction: speakerStyle,
+            seed: payload.seed,
+          });
+          fallbackBuffers.push(resTurn.buffer);
+          actualModelUsed = resTurn.actualModel;
+        }
+        const stitched = stitchWavBuffers(fallbackBuffers, 140, targetSampleRate, targetChannels);
+        rawMasterWav = stitched.wavBuffer;
       }
-      rawMasterWav = Buffer.from(audioPart.inlineData.data, 'base64');
     } else {
       // 3-6 speakers or stem separation: synthesize each turn cleanly and stitch + build stems
       const lineBuffers: Buffer[] = [];
@@ -352,17 +387,18 @@ export async function synthesizeSpeech(
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: getEmotionStyleHint(line.emotion),
         });
-        const buf = await callSingleSpeakerGeminiTts({
+        const turnResult = await callSingleSpeakerGeminiTts({
           ai,
-          model: 'gemini-3.8-flash-tts',
+          model: actualModelUsed as 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
           text: pron.ttsText,
           voiceName: sp.baseVoice || 'Puck',
           styleInstruction,
           seed: payload.seed,
         });
-        lineBuffers.push(buf);
+        actualModelUsed = turnResult.actualModel;
+        lineBuffers.push(turnResult.buffer);
         const list = speakerBuckets.get(sp.name) ?? [];
-        list.push(buf);
+        list.push(turnResult.buffer);
         speakerBuckets.set(sp.name, list);
       }
 
@@ -382,7 +418,7 @@ export async function synthesizeSpeech(
             durationMs: stemStitched.durationMs,
             voiceId,
             voiceName: speakerName,
-            modelUsed: 'gemini-3.8-flash-tts',
+            modelUsed: actualModelUsed,
             language,
             displayText: `${speakerName} stem`,
             masteringPreset,
@@ -432,15 +468,16 @@ export async function synthesizeSpeech(
           pronunciationPrompt: pron.pronunciationPrompt,
           emotionHint: seg.emotionPrompt,
         });
-        const segWav = await callSingleSpeakerGeminiTts({
+        const segRes = await callSingleSpeakerGeminiTts({
           ai,
-          model: 'gemini-3.8-flash-tts',
+          model: actualModelUsed as 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
           text: pron.ttsText,
           voiceName,
           styleInstruction: segStyle,
           seed: payload.seed,
         });
-        const processedSeg = processWavAudio(segWav, {
+        actualModelUsed = segRes.actualModel;
+        const processedSeg = processWavAudio(segRes.buffer, {
           targetSampleRate,
           targetChannels,
           trimSilence: true,
@@ -476,7 +513,7 @@ export async function synthesizeSpeech(
           durationMs: info.durationMs,
           voiceId,
           voiceName: voiceDisplayName,
-          modelUsed: 'gemini-3.8-flash-tts',
+          modelUsed: actualModelUsed,
           language,
           displayText: info.seg.displayText,
           masteringPreset,
@@ -527,14 +564,34 @@ export async function synthesizeSpeech(
         emotionHint: singleEmotion,
       });
 
-      rawMasterWav = await callSingleSpeakerGeminiTts({
-        ai,
-        model: modelUsed,
-        text: cleanTtsText || pron.ttsText,
-        voiceName,
-        styleInstruction,
-        seed: payload.seed,
-      });
+      const chunks = splitLongScriptIntoChunks(cleanTtsText || pron.ttsText, 3500);
+      if (chunks.length <= 1) {
+        const singleRes = await callSingleSpeakerGeminiTts({
+          ai,
+          model: actualModelUsed as 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
+          text: chunks[0] || cleanTtsText || pron.ttsText,
+          voiceName,
+          styleInstruction,
+          seed: payload.seed,
+        });
+        rawMasterWav = singleRes.buffer;
+        actualModelUsed = singleRes.actualModel;
+      } else {
+        const chunkWavs: Buffer[] = [];
+        for (const chunkText of chunks) {
+          const chunkRes = await callSingleSpeakerGeminiTts({
+            ai,
+            model: actualModelUsed as 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
+            text: chunkText,
+            voiceName,
+            styleInstruction,
+            seed: payload.seed,
+          });
+          actualModelUsed = chunkRes.actualModel;
+          chunkWavs.push(chunkRes.buffer);
+        }
+        rawMasterWav = stitchWavBuffers(chunkWavs, 150, targetSampleRate, targetChannels).wavBuffer;
+      }
     }
   }
 
@@ -579,7 +636,7 @@ export async function synthesizeSpeech(
     durationMs: processed.durationMs,
     voiceId,
     voiceName: voiceDisplayName,
-    modelUsed,
+    modelUsed: actualModelUsed,
     language,
     displayText: displayTextForCaptions,
     masteringPreset,
@@ -618,7 +675,7 @@ export async function synthesizeSpeech(
     sampleRate: processed.sampleRate,
     channels: processed.channels,
     sizeBytes: encoded.buffer.length,
-    modelUsed,
+    modelUsed: actualModelUsed,
     voiceId,
     voiceName: voiceDisplayName,
     durationEstimateSec: Math.max(1, Math.round(processed.durationMs / 1000)),
@@ -626,6 +683,7 @@ export async function synthesizeSpeech(
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks,
     segments: segmentsMeta,
     stems: stemsMeta,
     appliedPronunciations: Array.from(appliedPronunciations),
@@ -667,15 +725,19 @@ export async function regenerateClipSegment(params: {
   });
 
   const ai = getGeminiClient();
-  const newRawWav = await callSingleSpeakerGeminiTts({
+  const preferredModel =
+    existing.modelUsed === 'gemini-3.8-flash-tts'
+      ? 'gemini-3.8-flash-tts'
+      : 'gemini-3.8-flash-lite-tts';
+  const segResult = await callSingleSpeakerGeminiTts({
     ai,
-    model: 'gemini-3.8-flash-tts',
+    model: preferredModel,
     text: pron.ttsText,
     voiceName: voicePreset.baseVoice,
     styleInstruction,
   });
 
-  const processedNewSeg = processWavAudio(newRawWav, {
+  const processedNewSeg = processWavAudio(segResult.buffer, {
     targetSampleRate: existing.sampleRate,
     targetChannels: existing.channels,
     trimSilence: true,
@@ -700,7 +762,7 @@ export async function regenerateClipSegment(params: {
     durationMs: processedNewSeg.durationMs,
     voiceId: voicePreset.id,
     voiceName: `${voicePreset.name} (${voicePreset.roleTitle})`,
-    modelUsed: 'gemini-3.8-flash-tts',
+    modelUsed: segResult.actualModel,
     language: existing.language,
     displayText: nextText,
     masteringPreset: existing.masteringPreset,
@@ -774,7 +836,7 @@ export async function regenerateClipSegment(params: {
     durationMs: stitched.durationMs,
     voiceId: existing.voiceId,
     voiceName: existing.voiceName,
-    modelUsed: 'gemini-3.8-flash-tts',
+    modelUsed: segResult.actualModel,
     language: existing.language,
     displayText: fullDisplayText,
     masteringPreset: existing.masteringPreset,
@@ -802,6 +864,7 @@ export async function regenerateClipSegment(params: {
     wordTimings: combinedWords,
     phraseTimings: fullPhraseTimings,
     speechEnvelope: stitched.speechEnvelope,
+    waveformPeaks: stitched.waveformPeaks,
     segments: updatedSegments,
   };
 }
@@ -887,7 +950,7 @@ export async function localizeNarration(params: {
     const res = await synthesizeSpeech({
       mode: 'single',
       language: lang,
-      modelTier: 'expressive',
+      modelTier: 'standard',
       text: localizedText,
       voiceId: vPreset.id,
       voiceName: vPreset.baseVoice,
@@ -1094,6 +1157,7 @@ export async function matchAudioDuration(params: {
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope: processed.speechEnvelope,
+    waveformPeaks: processed.waveformPeaks,
   };
 }
 
@@ -1123,7 +1187,7 @@ export async function replaceAudioSegmentFromBuffer(params: {
   const repRes = await synthesizeSpeech({
     mode: 'single',
     language: params.language || 'en',
-    modelTier: 'expressive',
+    modelTier: 'standard',
     text: params.replacementText,
     voiceId: preset.id,
     voiceName: preset.baseVoice,
@@ -1148,6 +1212,7 @@ export async function replaceAudioSegmentFromBuffer(params: {
   const finalWav = encodeWavBuffer(toChannelCount(combined, ch), rate, ch);
   const durationMs = Math.round((combined.length / rate) * 1000);
   const speechEnvelope = extractSpeechEnvelope(combined, rate, 1, 25);
+  const waveformPeaks = extractWaveformPeaks(combined, 1, 120);
   const aligned = alignWordsToEnvelope(params.replacementText, durationMs, speechEnvelope);
 
   const saved = saveStoredClip({
@@ -1159,7 +1224,7 @@ export async function replaceAudioSegmentFromBuffer(params: {
     durationMs,
     voiceId: preset.id,
     voiceName: `${preset.name} (${preset.roleTitle})`,
-    modelUsed: 'gemini-3.8-flash-tts',
+    modelUsed: repRes.modelUsed,
     language: params.language || 'en',
     displayText: params.replacementText,
     masteringPreset: 'none',
@@ -1178,7 +1243,7 @@ export async function replaceAudioSegmentFromBuffer(params: {
     sampleRate: rate,
     channels: ch,
     sizeBytes: finalWav.length,
-    modelUsed: 'gemini-3.8-flash-tts',
+    modelUsed: repRes.modelUsed,
     voiceId: preset.id,
     voiceName: `${preset.name} (${preset.roleTitle})`,
     durationEstimateSec: Math.max(1, Math.round(durationMs / 1000)),
@@ -1186,5 +1251,6 @@ export async function replaceAudioSegmentFromBuffer(params: {
     wordTimings: aligned.wordTimings,
     phraseTimings: aligned.phraseTimings,
     speechEnvelope,
+    waveformPeaks,
   };
 }

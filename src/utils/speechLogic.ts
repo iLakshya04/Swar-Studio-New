@@ -11,7 +11,7 @@ import type {
 
 const DEVANAGARI_REGEX = /[\u0900-\u097F]/g;
 const LATIN_WORD_REGEX = /[A-Za-z]{2,}/g;
-const VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\||\[[A-Z_]{2,24}\])/i;
+const VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\|)/i;
 
 export function detectScriptLanguage(text: string): LanguageMode {
   const cleaned = text
@@ -244,6 +244,68 @@ export function buildStyleInstruction(params: {
   return parts.join('. ');
 }
 
+export function splitLongScriptIntoChunks(
+  text: string,
+  maxChunkChars = 3500
+): string[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  if (trimmed.length <= maxChunkChars) return [trimmed];
+
+  const paragraphs = trimmed
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const chunks: string[] = [];
+  let current = '';
+
+  const pushSentencewise = (block: string) => {
+    const sentences = block
+      .split(/(?<=[.!?।])\s+/u)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    for (const sentence of sentences) {
+      if (sentence.length > maxChunkChars) {
+        for (let i = 0; i < sentence.length; i += maxChunkChars) {
+          const slice = sentence.slice(i, i + maxChunkChars).trim();
+          if (slice) {
+            if (current) {
+              chunks.push(current);
+              current = '';
+            }
+            chunks.push(slice);
+          }
+        }
+        continue;
+      }
+      const next = current ? `${current} ${sentence}` : sentence;
+      if (next.length <= maxChunkChars) {
+        current = next;
+      } else {
+        if (current) chunks.push(current);
+        current = sentence;
+      }
+    }
+  };
+
+  for (const para of paragraphs) {
+    const candidate = current ? `${current}\n${para}` : para;
+    if (candidate.length <= maxChunkChars) {
+      current = candidate;
+    } else if (para.length <= maxChunkChars) {
+      if (current) chunks.push(current);
+      current = para;
+    } else {
+      pushSentencewise(para);
+    }
+  }
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
 export function validateGeneratePayload(
   payload: Partial<GenerateRequestPayload>
 ): { valid: boolean; error?: string } {
@@ -254,13 +316,6 @@ export function validateGeneratePayload(
       return {
         valid: false,
         error: 'Enter at least one non-empty dialogue line before generating audio.',
-      };
-    }
-    const totalLength = nonEmptyLines.reduce((acc, line) => acc + line.text.length, 0);
-    if (totalLength > 8000) {
-      return {
-        valid: false,
-        error: 'Dialogue script exceeds the 8,000-character limit.',
       };
     }
     if (
@@ -280,12 +335,6 @@ export function validateGeneratePayload(
     return {
       valid: false,
       error: 'Enter a script in English or Hindi before generating speech.',
-    };
-  }
-  if (text.length > 8000) {
-    return {
-      valid: false,
-      error: 'Script exceeds the 8,000-character limit.',
     };
   }
 

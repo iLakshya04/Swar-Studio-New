@@ -151,12 +151,15 @@ test('buildStyleInstruction includes custom voice, delivery style, pitch, emotio
   assert.match(style, /slow pacing/);
 });
 
-test('validateGeneratePayload rejects empty scripts and oversized scripts', () => {
+test('validateGeneratePayload rejects empty scripts and allows long scripts without 8k cap', () => {
   const emptyRes = validateGeneratePayload({ mode: 'single', text: '   ' });
   assert.equal(emptyRes.valid, false);
 
   const validRes = validateGeneratePayload({ mode: 'single', text: 'नमस्ते दुनिया' });
   assert.equal(validRes.valid, true);
+
+  const longScript = 'This lightning shoots upward. '.repeat(400); // > 11,000 chars
+  assert.equal(validateGeneratePayload({ mode: 'single', text: longScript }).valid, true);
 
   const emptyMulti = validateGeneratePayload({
     mode: 'multi',

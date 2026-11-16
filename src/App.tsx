@@ -8,6 +8,7 @@ import { SidebarNav, type ActiveTab } from './components/SidebarNav';
 import { SpeechStudio } from './components/SpeechStudio';
 import { VoiceLibrary } from './components/VoiceLibrary';
 import { DEFAULT_DIALOGUE_LINES, SAMPLE_TEMPLATES, VOICE_PRESETS } from './data/voices';
+import { useAudioPlayback } from './hooks/useAudioPlayback';
 import type {
   ChannelCount,
   DialogueLine,
@@ -26,12 +27,12 @@ import type {
   StudioMode,
   VoicePreset,
 } from './types';
-import { validateGeneratePayload } from './utils/speechLogic';
+import { generate, regenerateSegment } from './utils/generateClient';
 
 const HISTORY_STORAGE_KEY = 'svara_studio_history_v1';
 const PRONUNCIATION_STORAGE_KEY = 'svara_pronunciations_v1';
 const THEME_STORAGE_KEY = 'svara_theme_v1';
-const MAX_STORED_CLIPS = 10;
+const MAX_STORED_CLIPS = 100;
 
 function loadHistory(): HistoryItem[] {
   try {
@@ -45,13 +46,25 @@ function loadHistory(): HistoryItem[] {
 }
 
 function saveHistory(items: HistoryItem[]): void {
+  const capped = items.slice(0, MAX_STORED_CLIPS);
   try {
-    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(items.slice(0, MAX_STORED_CLIPS)));
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(capped));
   } catch {
+    // Keep newest 3 inline audio blobs and keep URL + wordTimings + waveformPeaks for the rest
+    const compacted = capped.map((item, idx) =>
+      idx < 3 ? item : { ...item, audioBase64: '' }
+    );
     try {
-      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(items.slice(0, 3)));
+      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(compacted));
     } catch {
-      // Ignore storage quota overflow gracefully
+      try {
+        localStorage.setItem(
+          HISTORY_STORAGE_KEY,
+          JSON.stringify(capped.slice(0, 20).map((item) => ({ ...item, audioBase64: '' })))
+        );
+      } catch {
+        // Ignore storage quota overflow gracefully
+      }
     }
   }
 }
@@ -91,7 +104,7 @@ export default function App() {
   const [speed, setSpeed] = useState<number>(1.0);
   const [pitchRegister, setPitchRegister] = useState<PitchRegister>('balanced');
   const [emotionIntensity, setEmotionIntensity] = useState<EmotionIntensity>('natural');
-  const [engineTier, setEngineTier] = useState<EngineTier>('expressive');
+  const [engineTier, setEngineTier] = useState<EngineTier>('standard');
   const [sampleRate, setSampleRate] = useState<SampleRateHz>(48000);
   const [channels, setChannels] = useState<ChannelCount>(1);
   const [masteringPreset, setMasteringPreset] = useState<MasteringPreset>('none');
@@ -130,6 +143,7 @@ export default function App() {
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [activeTrack, setActiveTrack] = useState<ActiveTrack | null>(null);
   const [latestResult, setLatestResult] = useState<GenerateResponsePayload | null>(null);
+  const playback = useAudioPlayback(activeTrack, setErrorMessage);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDark);
@@ -351,6 +365,7 @@ export default function App() {
       durationMs: data.durationMs,
       audioBase64: data.audioBase64,
       wordTimings: data.wordTimings,
+      waveformPeaks: data.waveformPeaks,
       segments: data.segments,
       dialogueLines: mode === 'multi' ? dialogueLines : undefined,
       speakers: mode === 'multi' ? speakers : undefined,
@@ -370,6 +385,7 @@ export default function App() {
       sampleRate: data.sampleRate || sampleRate,
       channels: data.channels || channels,
       wordTimings: data.wordTimings,
+      waveformPeaks: data.waveformPeaks,
     });
   };
 
@@ -402,26 +418,11 @@ export default function App() {
       dialogueLines: mode === 'multi' ? dialogueLines : undefined,
     };
 
-    const validation = validateGeneratePayload(payload);
-    if (!validation.valid) {
-      setErrorMessage(validation.error || 'Please check your script inputs.');
-      return;
-    }
-
     setErrorMessage(null);
     setIsGenerating(true);
 
     try {
-      const response = await fetch('/api/tts/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = (await response.json()) as GenerateResponsePayload & { error?: string };
-
-      if (!response.ok || !data.audioBase64) {
-        throw new Error(data.error || 'Speech generation failed.');
-      }
+      const data = await generate(payload);
 
       const fullScript =
         mode === 'multi'
@@ -453,22 +454,14 @@ export default function App() {
     setRegeneratingSegIdx(segmentIndex);
     setErrorMessage(null);
     try {
-      const response = await fetch('/api/tts/segments/regenerate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clipId: latestResult.clipId,
-          segmentIndex,
-          text: nextText,
-          voiceId: selectedVoice.id,
-          stylePrompt,
-          speed,
-        }),
+      const data = await regenerateSegment({
+        clipId: latestResult.clipId,
+        segmentIndex,
+        text: nextText,
+        voiceId: selectedVoice.id,
+        stylePrompt,
+        speed,
       });
-      const data = (await response.json()) as GenerateResponsePayload & { error?: string };
-      if (!response.ok || !data.audioBase64) {
-        throw new Error(data.error || 'Segment regeneration failed.');
-      }
       const updatedText = data.segments?.map((s) => s.text).join(' ') || text;
       pushGeneratedClip(
         data,
@@ -491,7 +484,7 @@ export default function App() {
       const payload: GenerateRequestPayload = {
         mode: 'single',
         language: voice.sampleLanguage,
-        modelTier: 'expressive',
+        modelTier: 'standard',
         text: voice.sampleText,
         voiceId: voice.id,
         voiceName: voice.baseVoice,
@@ -501,15 +494,7 @@ export default function App() {
         channels: 1,
         pronunciationRules: pronunciations,
       };
-      const response = await fetch('/api/tts/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = (await response.json()) as GenerateResponsePayload & { error?: string };
-      if (!response.ok || !data.audioBase64) {
-        throw new Error(data.error || 'Voice sample preview failed.');
-      }
+      const data = await generate(payload);
 
       setActiveTrack({
         id: `preview-${voice.id}-${Date.now()}`,
@@ -523,6 +508,7 @@ export default function App() {
         sampleRate: data.sampleRate || 48000,
         channels: data.channels || 1,
         wordTimings: data.wordTimings,
+        waveformPeaks: data.waveformPeaks,
       });
     } catch (err) {
       setErrorMessage(
@@ -546,6 +532,7 @@ export default function App() {
       sampleRate: item.sampleRate,
       channels: item.channels,
       wordTimings: item.wordTimings,
+      waveformPeaks: item.waveformPeaks,
     });
   };
 
@@ -763,6 +750,13 @@ export default function App() {
                   dialogueLines={dialogueLines}
                   onDialogueLinesChange={setDialogueLines}
                   latestResult={latestResult}
+                  activeTrack={activeTrack}
+                  playbackCurrentTime={playback.currentTime}
+                  playbackDuration={playback.duration}
+                  isPlaying={playback.isPlaying}
+                  hasAudio={Boolean(playback.audioSrc)}
+                  onTogglePlay={playback.togglePlay}
+                  onSeek={playback.seekTo}
                   regeneratingSegIdx={regeneratingSegIdx}
                   onRegenerateSegment={handleRegenerateSegment}
                   isGenerating={isGenerating}
@@ -818,9 +812,9 @@ export default function App() {
 
           <AudioPlayerBar
             track={activeTrack}
+            playback={playback}
             isGenerating={isGenerating || previewingVoiceId !== null}
             isDark={isDark}
-            onPlaybackError={setErrorMessage}
           />
         </div>
       </div>

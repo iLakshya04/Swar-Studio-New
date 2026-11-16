@@ -9,6 +9,7 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import type { AudioPlaybackController } from '../hooks/useAudioPlayback';
 import type { ChannelCount, SampleRateHz, SubtitleFormat, WordTiming } from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
 import { generateSubtitles } from '../utils/subtitleGenerator';
@@ -25,91 +26,42 @@ export interface ActiveTrack {
   sampleRate?: SampleRateHz;
   channels?: ChannelCount;
   wordTimings?: WordTiming[];
+  waveformPeaks?: number[];
 }
 
 interface AudioPlayerBarProps {
   track: ActiveTrack | null;
+  playback: AudioPlaybackController;
   isGenerating: boolean;
   isDark?: boolean;
-  onPlaybackError?: (msg: string) => void;
 }
-
-const SPEED_OPTIONS = [0.85, 1.0, 1.25, 1.5];
 
 export function AudioPlayerBar({
   track,
+  playback,
   isGenerating,
   isDark = false,
-  onPlaybackError,
 }: AudioPlayerBarProps) {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
-
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [playbackRate, setPlaybackRate] = useState(1.0);
-  const [volume, setVolume] = useState(0.9);
-  const [isMuted, setIsMuted] = useState(false);
-  const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
 
-  useEffect(() => {
-    if (!track?.audioBase64) {
-      setBlobUrl(null);
-      setIsPlaying(false);
-      setCurrentTime(0);
-      setDuration(0);
-      return;
-    }
-
-    try {
-      const binary = atob(track.audioBase64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i += 1) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      const blob = new Blob([bytes], { type: 'audio/wav' });
-      const url = URL.createObjectURL(blob);
-      setBlobUrl(url);
-      setCurrentTime(0);
-      setDuration(track.durationSec || 0);
-
-      return () => {
-        URL.revokeObjectURL(url);
-      };
-    } catch {
-      onPlaybackError?.('Unable to decode generated WAV audio.');
-      return undefined;
-    }
-  }, [track, onPlaybackError]);
-
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !blobUrl) {
-      return;
-    }
-    audio.src = blobUrl;
-    audio.playbackRate = playbackRate;
-    audio.volume = isMuted ? 0 : volume;
-    audio
-      .play()
-      .then(() => setIsPlaying(true))
-      .catch(() => setIsPlaying(false));
-  }, [blobUrl]);
-
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.playbackRate = playbackRate;
-  }, [playbackRate]);
-
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.volume = isMuted ? 0 : volume;
-  }, [volume, isMuted]);
+  const {
+    audioRef,
+    audioSrc,
+    isPlaying,
+    currentTime,
+    duration,
+    playbackRate,
+    volume,
+    isMuted,
+    togglePlay,
+    seekTo,
+    cycleSpeed,
+    setVolume,
+    toggleMute,
+    audioHandlers,
+  } = playback;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -118,6 +70,8 @@ export function AudioPlayerBar({
     if (!ctx) return;
 
     const barCount = 44;
+    const realPeaks = track?.waveformPeaks;
+
     const draw = (timeMs: number) => {
       const width = canvas.width;
       const height = canvas.height;
@@ -128,9 +82,18 @@ export function AudioPlayerBar({
 
       for (let i = 0; i < barCount; i += 1) {
         const ratio = i / barCount;
-        const baseEnvelope = 0.35 + 0.5 * Math.sin(i * 0.65 + 0.8) ** 2;
+        let baseEnvelope: number;
+        if (realPeaks && realPeaks.length > 0) {
+          const peakIdx = Math.min(
+            realPeaks.length - 1,
+            Math.floor((i / barCount) * realPeaks.length)
+          );
+          baseEnvelope = 0.2 + 0.78 * realPeaks[peakIdx];
+        } else {
+          baseEnvelope = 0.35 + 0.5 * Math.sin(i * 0.65 + 0.8) ** 2;
+        }
         const motionOffset = isPlaying
-          ? 0.25 * Math.sin(timeMs * 0.008 + i * 0.55)
+          ? 0.12 * Math.sin(timeMs * 0.008 + i * 0.55)
           : 0;
         const barH = Math.max(
           4,
@@ -162,33 +125,6 @@ export function AudioPlayerBar({
     };
   }, [isPlaying, currentTime, duration, track, isDark]);
 
-  const togglePlay = () => {
-    const audio = audioRef.current;
-    if (!audio || !blobUrl) return;
-    if (isPlaying) {
-      audio.pause();
-      setIsPlaying(false);
-    } else {
-      audio
-        .play()
-        .then(() => setIsPlaying(true))
-        .catch(() => setIsPlaying(false));
-    }
-  };
-
-  const handleSeek = (nextTime: number) => {
-    const audio = audioRef.current;
-    if (!audio || !blobUrl) return;
-    audio.currentTime = nextTime;
-    setCurrentTime(nextTime);
-  };
-
-  const cycleSpeed = () => {
-    const idx = SPEED_OPTIONS.indexOf(playbackRate);
-    const next = SPEED_OPTIONS[(idx + 1) % SPEED_OPTIONS.length];
-    setPlaybackRate(next);
-  };
-
   const handleDownloadWav = () => {
     if (!track) return;
     const safeName =
@@ -197,8 +133,8 @@ export function AudioPlayerBar({
     const anchor = document.createElement('a');
     if (track.clipId) {
       anchor.href = `/api/clips/${track.clipId}.wav?download=1`;
-    } else if (blobUrl) {
-      anchor.href = blobUrl;
+    } else if (audioSrc) {
+      anchor.href = audioSrc;
     } else {
       return;
     }
@@ -252,14 +188,11 @@ export function AudioPlayerBar({
     >
       <audio
         ref={audioRef}
-        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => {
-          const d = e.currentTarget.duration;
-          if (Number.isFinite(d) && d > 0) {
-            setDuration(d);
-          }
-        }}
-        onEnded={() => setIsPlaying(false)}
+        onTimeUpdate={audioHandlers.onTimeUpdate}
+        onLoadedMetadata={audioHandlers.onLoadedMetadata}
+        onEnded={audioHandlers.onEnded}
+        onPlay={audioHandlers.onPlay}
+        onPause={audioHandlers.onPause}
       />
 
       <div className="max-w-7xl mx-auto flex flex-wrap lg:flex-nowrap items-center justify-between gap-3">
@@ -309,10 +242,10 @@ export function AudioPlayerBar({
               aria-label="Audio playback position"
               min={0}
               max={duration > 0 ? duration : 1}
-              step={0.1}
+              step={0.05}
               value={Math.min(currentTime, duration > 0 ? duration : 1)}
               disabled={!track}
-              onChange={(e) => handleSeek(Number(e.target.value))}
+              onChange={(e) => seekTo(Number(e.target.value), false)}
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-default"
             />
           </div>
@@ -334,7 +267,7 @@ export function AudioPlayerBar({
           <div className="hidden xl:flex items-center gap-1.5 px-1">
             <button
               type="button"
-              onClick={() => setIsMuted((prev) => !prev)}
+              onClick={toggleMute}
               aria-label={isMuted ? 'Unmute audio' : 'Mute audio'}
               className="p-1.5 rounded-md text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
             >
@@ -351,10 +284,7 @@ export function AudioPlayerBar({
               max={1}
               step={0.05}
               value={isMuted ? 0 : volume}
-              onChange={(e) => {
-                setIsMuted(false);
-                setVolume(Number(e.target.value));
-              }}
+              onChange={(e) => setVolume(Number(e.target.value))}
               className="w-16 accent-[#2563EB] cursor-pointer"
             />
           </div>
