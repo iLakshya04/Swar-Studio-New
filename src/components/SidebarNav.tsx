@@ -1,7 +1,7 @@
-import { AudioWaveform, Clock, Library, Mic2, Plug } from 'lucide-react';
+import { AudioWaveform, Clock, Library, Mic, Mic2, Plug } from 'lucide-react';
 import type { LanguageMode } from '../types';
 
-export type ActiveTab = 'studio' | 'voices' | 'history' | 'mcp';
+export type ActiveTab = 'studio' | 'voices' | 'cloning' | 'history' | 'mcp';
 
 interface SidebarNavProps {
   activeTab: ActiveTab;
@@ -28,6 +28,7 @@ export function SidebarNav({
   }> = [
     { id: 'studio', label: 'Speech Studio', icon: Mic2 },
     { id: 'voices', label: 'Voice Library', icon: Library, count: voiceCount },
+    { id: 'cloning', label: 'Voice Cloning', icon: Mic },
     { id: 'history', label: 'History', icon: Clock, count: historyCount },
     { id: 'mcp', label: 'MCP Connect', icon: Plug },
   ];

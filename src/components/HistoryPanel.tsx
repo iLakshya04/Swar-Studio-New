@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Captions, Download, Mic2, Play, RotateCcw, Search, Trash2 } from 'lucide-react';
 import type { AudioPlaybackController } from '../hooks/useAudioPlayback';
-import type { HistoryItem, SubtitleFormat } from '../types';
+import type { HistoryItem, SubtitleFormat, SubtitleGranularity } from '../types';
 import { formatAudioTime } from '../utils/speechLogic';
 import { generate_subtitles } from '../utils/subtitleGenerator';
 import { InteractiveWaveform } from './InteractiveWaveform';
@@ -10,6 +10,7 @@ interface HistoryPanelProps {
   items: HistoryItem[];
   activeTrackId: string | null;
   playback: AudioPlaybackController;
+  isDark?: boolean;
   onPlayItem: (item: HistoryItem) => void;
   onRestoreToStudio: (item: HistoryItem) => void;
   onDeleteItem: (id: string) => void;
@@ -21,6 +22,7 @@ export function HistoryPanel({
   items,
   activeTrackId,
   playback,
+  isDark = false,
   onPlayItem,
   onRestoreToStudio,
   onDeleteItem,
@@ -81,11 +83,16 @@ export function HistoryPanel({
     }
   };
 
-  const handleDownloadSubtitles = (item: HistoryItem, format: SubtitleFormat) => {
+  const handleDownloadSubtitles = (
+    item: HistoryItem,
+    format: SubtitleFormat,
+    granularity: SubtitleGranularity = 'phrase'
+  ) => {
     if (!item.wordTimings?.length) return;
     const subText = generate_subtitles({
       wordTimings: item.wordTimings,
       format,
+      granularity,
       preset: format === 'ass' ? 'rainbow_reels' : 'clean_editorial',
       maxLines,
       maxDurationSeconds: maxDurationSec,
@@ -95,7 +102,7 @@ export function HistoryPanel({
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `svara-${item.clipId || item.id}.${format}`;
+    anchor.download = `svara-${item.clipId || item.id}${granularity === 'word' ? '-words' : ''}.${format}`;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
@@ -218,6 +225,7 @@ export function HistoryPanel({
               currentTime={isInspectedActive ? playback.currentTime : 0}
               isPlaying={isInspectedActive ? playback.isPlaying : false}
               hasAudio={Boolean(inspectedItem.audioBase64 || inspectedItem.clipId)}
+              isDark={isDark}
               onTogglePlay={() => {
                 if (isInspectedActive && playback.audioSrc) {
                   playback.togglePlay();
@@ -281,7 +289,7 @@ export function HistoryPanel({
                       : item.language === 'bilingual'
                         ? 'Bilingual'
                         : 'English'}{' '}
-                    · {rateLabel} {channelLabel} WAV · {formatAudioTime(item.durationSec)} ·{' '}
+                    · {item.modelUsed === 'webspeech:os-voice' ? 'Browser OS Voice' : `${rateLabel} ${channelLabel} WAV`} · {formatAudioTime(item.durationSec)} ·{' '}
                     {item.wordTimings?.length ? `${item.wordTimings.length} words · ` : ''}
                     {dateLabel}
                   </p>
@@ -302,7 +310,7 @@ export function HistoryPanel({
                   <>
                     <button
                       type="button"
-                      onClick={() => handleDownloadSubtitles(item, 'srt')}
+                      onClick={() => handleDownloadSubtitles(item, 'srt', 'phrase')}
                       aria-label={`Download SRT subtitles for ${item.textPreview}`}
                       className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
                     >
@@ -311,7 +319,16 @@ export function HistoryPanel({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleDownloadSubtitles(item, 'vtt')}
+                      onClick={() => handleDownloadSubtitles(item, 'srt', 'word')}
+                      data-testid="history-download-word-srt"
+                      aria-label={`Download word-level SRT subtitles for ${item.textPreview}`}
+                      className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#2563EB] dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
+                    >
+                      <span>Word .SRT</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadSubtitles(item, 'vtt', 'phrase')}
                       aria-label={`Download VTT subtitles for ${item.textPreview}`}
                       className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
                     >
@@ -319,7 +336,7 @@ export function HistoryPanel({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleDownloadSubtitles(item, 'ass')}
+                      onClick={() => handleDownloadSubtitles(item, 'ass', 'phrase')}
                       aria-label={`Download ASS captions for ${item.textPreview}`}
                       className="inline-flex items-center gap-1 px-2.5 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap"
                     >
@@ -328,15 +345,17 @@ export function HistoryPanel({
                   </>
                 )}
 
-                <button
-                  type="button"
-                  onClick={() => handleDownloadWav(item)}
-                  aria-label={`Download WAV for ${item.textPreview}`}
-                  className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-[#0F172A] dark:bg-[#2563EB] text-white text-xs font-medium hover:bg-slate-800 dark:hover:bg-blue-700 transition-colors whitespace-nowrap"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download WAV</span>
-                </button>
+                {item.modelUsed !== 'webspeech:os-voice' && (
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadWav(item)}
+                    aria-label={`Download WAV for ${item.textPreview}`}
+                    className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg bg-[#0F172A] dark:bg-[#2563EB] text-white text-xs font-medium hover:bg-slate-800 dark:hover:bg-blue-700 transition-colors whitespace-nowrap"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download WAV</span>
+                  </button>
+                )}
 
                 <button
                   type="button"

@@ -10,8 +10,10 @@ import {
   alignWordsToEnvelope,
   alignWordsToWavPcm,
   generateSubtitles,
+  generateWordLevelSrt,
   generate_subtitles,
 } from './subtitleGenerator';
+import { buildAiPluginManifest, buildOpenApiSpec } from '../server/openApiSpec';
 import {
   applyMasteringPresetMono,
   encodeWavBuffer,
@@ -41,7 +43,22 @@ import {
   markModelCooldown,
 } from '../server/quotaError';
 import { generate, normalizeWordTimings } from './generateClient';
-import type { GenerateRequestPayload, PronunciationEntry } from '../types';
+import {
+  resolveKeylessVoiceProfile,
+  splitTextForKeylessChunks,
+  stripTagsForKeylessTts,
+} from '../server/keylessTts';
+import {
+  buildClonePresetFromMetrics,
+  extractAcousticProfileFromPcm,
+} from '../server/voiceAnalysis';
+import {
+  computeWebSpeechPitch,
+  stripTagsForWebSpeech,
+  synthesizeWithWebSpeech,
+} from './webSpeechFallback';
+import { deriveHeaderConnectionMode } from '../components/ConnectionStatusBadge';
+import type { GenerateRequestPayload, PronunciationEntry, ProviderHealthSnapshot } from '../types';
 
 function makeSineWav(sampleRate: number, durationSec: number, freqHz = 220, amp = 8000): Buffer {
   const totalSamples = Math.round(sampleRate * durationSec);
@@ -397,4 +414,231 @@ test('splitLongScriptIntoChunkPlans preserves paragraph pauses and active [EMOTI
   assert.ok(plans[0].breakAfterMs > 0);
   assert.equal(plans[plans.length - 1].breakAfterMs, 0);
 });
+
+test('generateWordLevelSrt and generate_subtitles granularity="word" produce 1 word per SRT cue with exact startMs/endMs', () => {
+  const wordTimings = [
+    { word: 'Blue', startMs: 120, endMs: 410, startSeconds: 0.12, endSeconds: 0.41 },
+    { word: 'jets', startMs: 410, endMs: 780, startSeconds: 0.41, endSeconds: 0.78 },
+    { word: 'pierce', startMs: 780, endMs: 1120, startSeconds: 0.78, endSeconds: 1.12 },
+    { word: 'clouds.', startMs: 1120, endMs: 1580, startSeconds: 1.12, endSeconds: 1.58 },
+  ];
+
+  const directSrt = generateWordLevelSrt(wordTimings);
+  const viaOpts = generate_subtitles({
+    wordTimings,
+    format: 'srt',
+    granularity: 'word',
+  });
+  const viaAlias = generate_subtitles({
+    wordTimings,
+    format: 'srt',
+    wordLevel: true,
+    preset: 'clean_editorial',
+  });
+
+  assert.equal(directSrt, viaOpts);
+  assert.equal(viaOpts, viaAlias);
+  const blocks = directSrt.split('\n\n');
+  assert.equal(blocks.length, 4);
+  assert.equal(blocks[0], '1\n00:00:00,120 --> 00:00:00,410\nBlue');
+  assert.equal(blocks[1], '2\n00:00:00,410 --> 00:00:00,780\njets');
+  assert.equal(blocks[3], '4\n00:00:01,120 --> 00:00:01,580\nclouds.');
+});
+
+test('generate utility derives word-level startMs/endMs when omitted and attaches wordSrt when includeWordLevelSrt is true', async () => {
+  const payload: GenerateRequestPayload = {
+    mode: 'single',
+    language: 'en',
+    modelTier: 'standard',
+    text: 'Svara creates crisp captions.',
+    voiceName: 'Charon',
+    stylePrompt: 'Clear documentary',
+    speed: 1.0,
+    includeWordLevelSrt: true,
+  };
+
+  const fakeFetch: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({
+        clipId: 'clip_word_srt_fallback',
+        audioBase64: 'UklGRg==',
+        mimeType: 'audio/wav',
+        modelUsed: 'gemini-2.5-flash-preview-tts',
+        durationEstimateSec: 2.0,
+        durationMs: 2000,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+
+  const result = await generate(payload, fakeFetch);
+  assert.equal(result.wordTimings?.length, 4);
+  assert.ok(typeof result.wordTimings?.[0]?.startMs === 'number');
+  assert.ok(typeof result.wordTimings?.[0]?.endMs === 'number');
+  assert.ok((result.wordTimings?.[0]?.endMs ?? 0) > (result.wordTimings?.[0]?.startMs ?? 0));
+  assert.ok(result.wordSrt?.includes('1\n00:00:00,'));
+  assert.ok(result.wordSrt?.includes('Svara'));
+  assert.ok(result.wordSrt?.includes('captions.'));
+});
+
+test('OpenAPI spec and AI plugin manifest expose all Svara Studio capabilities', () => {
+  const manifest = buildAiPluginManifest('https://svara.example.com/');
+  assert.equal(manifest.schema_version, 'v1');
+  assert.equal(manifest.api.url, 'https://svara.example.com/openapi.json');
+
+  const spec = buildOpenApiSpec('https://svara.example.com');
+  assert.equal(spec.openapi, '3.1.0');
+  const paths = Object.keys(spec.paths);
+  for (const requiredPath of [
+    '/api/voices',
+    '/api/tts/generate',
+    '/api/tts/segments/regenerate',
+    '/api/clips/{id}',
+    '/api/clips/{id}/subtitles/{format}',
+    '/api/subtitles',
+    '/api/script/translate',
+    '/api/script/localize',
+    '/api/audio/transcribe',
+    '/api/audio/analyze-voice',
+    '/api/audio/match-duration',
+    '/api/audio/replace-segment',
+    '/api/pronunciations',
+    '/api/presets',
+    '/api/projects',
+    '/api/projects/{id}/export',
+  ]) {
+    assert.ok(paths.includes(requiredPath), `Missing OpenAPI path ${requiredPath}`);
+  }
+});
+
+test('keylessTts strips performance tags, splits Hinglish/long scripts cleanly, and maps personas', () => {
+  const cleaned = stripTagsForKeylessTts('[CURIOUS] Hello creators! <breath> |yeah| Listen closely.');
+  assert.equal(cleaned, 'Hello creators! , yeah, Listen closely.');
+
+  const hinglishChunks = splitTextForKeylessChunks(
+    'Hey everyone, आज के episode में हम बात करेंगे AI voice tech के बारे में!',
+    'bilingual',
+    175
+  );
+  assert.ok(hinglishChunks.length >= 3);
+  assert.equal(hinglishChunks[0].langHint, 'en');
+  assert.equal(hinglishChunks[1].langHint, 'hi');
+  assert.equal(hinglishChunks[2].langHint, 'en');
+
+  const longChunks = splitTextForKeylessChunks(
+    'This science documentary explores blue jets above thunderclouds. '.repeat(10),
+    'en',
+    160
+  );
+  assert.ok(longChunks.length >= 4);
+  assert.ok(longChunks.every((c) => c.text.length <= 160 && c.langHint === 'en'));
+
+  const ethanProfile = resolveKeylessVoiceProfile({
+    voiceId: 'ethan',
+    voiceName: 'Charon',
+    language: 'en',
+    pitchRegister: 'deep',
+  });
+  assert.equal(ethanProfile.tiktokVoice, 'en_male_narration');
+  assert.ok(ethanProfile.pitchFactor < 0.9);
+
+  const arthurProfile = resolveKeylessVoiceProfile({
+    voiceId: 'arthur',
+    voiceName: 'Fenrir',
+    language: 'en',
+    pitchRegister: 'balanced',
+  });
+  assert.equal(arthurProfile.tiktokVoice, 'en_uk_003');
+  assert.equal(arthurProfile.googleEnglishLang, 'en-GB');
+
+  assert.equal(
+    selectTtsModel({ mode: 'single', modelTier: 'keyless', text: 'Hello Svara Studio' }),
+    'keyless:neural-tts'
+  );
+  assert.equal(
+    selectTtsModel({ mode: 'single', modelTier: 'keyless', text: 'नमस्ते स्वरा स्टूडियो' }),
+    'keyless:google-tts'
+  );
+});
+
+test('Web Speech fallback prepares local tracks, word timings, SRT, and pitch cleanly', async () => {
+  assert.equal(
+    selectTtsModel({ mode: 'single', modelTier: 'webspeech', text: 'Offline narration check' }),
+    'webspeech:os-voice'
+  );
+  assert.equal(
+    stripTagsForWebSpeech('[AWE] Welcome creators! <breath> |yeah| Let us begin.'),
+    'Welcome creators! , yeah, Let us begin.'
+  );
+  assert.ok(computeWebSpeechPitch('deep') < 0.9);
+  assert.ok(computeWebSpeechPitch('bright') > 1.1);
+
+  const wsResult = await synthesizeWithWebSpeech({
+    mode: 'single',
+    language: 'en',
+    modelTier: 'webspeech',
+    text: '[CURIOUS] Offline voices still create live word timings.',
+    voiceName: 'Charon',
+    voiceId: 'ethan',
+    stylePrompt: 'Calm',
+    speed: 1.0,
+  });
+
+  assert.equal(wsResult.isLocalWebSpeech, true);
+  assert.equal(wsResult.modelUsed, 'webspeech:os-voice');
+  assert.equal(wsResult.timingSource, 'estimated');
+  assert.ok((wsResult.wordTimings?.length ?? 0) >= 6);
+  assert.ok(Array.isArray(wsResult.waveformPeaks) && wsResult.waveformPeaks.length === 120);
+  assert.ok(wsResult.wordSrt?.includes('Offline'));
+});
+
+test('ConnectionStatusBadge switches to Offline Mode when offline, falling back, or webspeech active', () => {
+  const baseHealth: ProviderHealthSnapshot = {
+    ok: true,
+    browserOnline: true,
+    serverReachable: true,
+    webSpeechSupported: true,
+    providers: { gemini: true, openai: false, elevenlabs: false, keyless: true },
+    lastCheckedAt: new Date().toISOString(),
+    fallbackActive: false,
+  };
+
+  assert.equal(deriveHeaderConnectionMode(baseHealth, 'standard').mode, 'cloud');
+  assert.equal(deriveHeaderConnectionMode(baseHealth, 'keyless').mode, 'keyless');
+  assert.equal(deriveHeaderConnectionMode(baseHealth, 'webspeech').label, 'Offline Mode');
+  assert.equal(
+    deriveHeaderConnectionMode({ ...baseHealth, fallbackActive: true }, 'standard').label,
+    'Offline Mode'
+  );
+  assert.equal(
+    deriveHeaderConnectionMode({ ...baseHealth, browserOnline: false }, 'standard').label,
+    'Offline Mode'
+  );
+});
+
+test('Voice cloning DSP extracts F0 pitch register and builds persisted Clone presets', () => {
+  const sampleRate = 24000;
+  const totalSamples = sampleRate * 2;
+  const deepPcm = new Int16Array(totalSamples);
+  for (let i = 0; i < totalSamples; i += 1) {
+    // 120 Hz fundamental voiced tone
+    deepPcm[i] = Math.round(9000 * Math.sin((2 * Math.PI * 120 * i) / sampleRate));
+  }
+
+  const metrics = extractAcousticProfileFromPcm(deepPcm, sampleRate, 2000);
+  assert.ok(metrics.pitchHz >= 110 && metrics.pitchHz <= 130, `Got ${metrics.pitchHz}Hz`);
+  assert.equal(metrics.pitchRegister, 'deep');
+
+  const clonePreset = buildClonePresetFromMetrics({
+    presetName: 'Rohan Narration',
+    language: 'bilingual',
+    metrics,
+  });
+  assert.equal(clonePreset.isClone, true);
+  assert.equal(clonePreset.name, 'Clone — Rohan Narration');
+  assert.equal(clonePreset.pitchRegister, 'deep');
+  assert.ok(clonePreset.cloneAcousticProfile?.pitchHz);
+});
+
+
+
 

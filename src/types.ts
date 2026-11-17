@@ -1,6 +1,6 @@
 export type LanguageMode = 'en' | 'hi' | 'bilingual';
 export type StudioMode = 'single' | 'multi';
-export type EngineTier = 'standard' | 'expressive';
+export type EngineTier = 'standard' | 'expressive' | 'keyless' | 'webspeech';
 export type PrebuiltVoiceName = 'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr';
 export type PitchRegister = 'deep' | 'balanced' | 'bright';
 export type EmotionIntensity = 'subtle' | 'natural' | 'dramatic';
@@ -16,6 +16,7 @@ export type MasteringPreset =
   | 'audiobook';
 export type FitMode = 'natural' | 'tight' | 'stretch';
 export type SubtitleFormat = 'srt' | 'vtt' | 'ass' | 'json';
+export type SubtitleGranularity = 'phrase' | 'word';
 export type SubtitlePreset = 'rainbow_reels' | 'clean_editorial';
 export type TimingSource = 'provider' | 'forced_alignment' | 'estimated';
 
@@ -157,6 +158,7 @@ export interface GenerateRequestPayload extends AudioExportConfig {
   projectId?: string;
   returnWordTimings?: boolean;
   returnWaveformPeaks?: boolean;
+  includeWordLevelSrt?: boolean;
 }
 
 export interface GenerateResponsePayload {
@@ -179,11 +181,28 @@ export interface GenerateResponsePayload {
   timingConfidence?: number;
   wordTimings?: WordTiming[];
   phraseTimings?: PhraseTiming[];
+  wordSrt?: string;
+  wordSrtUrl?: string;
   speechEnvelope?: SpeechEnvelopeInterval[];
   waveformPeaks?: number[];
   segments?: SpeechSegmentMeta[];
   stems?: Array<{ speaker: string; clipId: string; audioUrl: string; durationMs: number }>;
   appliedPronunciations?: string[];
+  isLocalWebSpeech?: boolean;
+  localSpeechScript?: string;
+  fallbackReason?: string;
+}
+
+export interface CloneAcousticProfile {
+  pitchHz: number;
+  pitchRegister: PitchRegister;
+  speakingWpm: number;
+  warmth: number;
+  brightness: number;
+  energy: number;
+  timbreSummary: string;
+  matchedBaseVoiceName: PrebuiltVoiceName;
+  source: 'dsp' | 'gemini+dsp' | 'browser-audio';
 }
 
 export interface SavedVoicePresetConfig {
@@ -201,6 +220,29 @@ export interface SavedVoicePresetConfig {
   sampleRate?: SampleRateHz;
   channels?: ChannelCount;
   createdAt: string;
+  isClone?: boolean;
+  clonedAt?: string;
+  sampleDurationMs?: number;
+  cloneAcousticProfile?: CloneAcousticProfile;
+}
+
+export interface ProviderHealthSnapshot {
+  ok: boolean;
+  browserOnline: boolean;
+  serverReachable: boolean;
+  webSpeechSupported: boolean;
+  providers: {
+    gemini: boolean;
+    openai: boolean;
+    elevenlabs: boolean;
+    keyless: boolean;
+  };
+  version?: string;
+  build?: string;
+  lastCheckedAt: string | null;
+  fallbackActive: boolean;
+  fallbackReason?: string | null;
+  offlineReason?: string | null;
 }
 
 export interface StudioProjectClip {

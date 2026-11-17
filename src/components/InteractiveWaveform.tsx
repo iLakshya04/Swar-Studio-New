@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Pause, Play } from 'lucide-react';
 import type { TimingSource, WordTiming } from '../types';
-import { buildFallbackWaveformPeaks } from '../utils/generateClient';
+import { WaveformCanvas } from './WaveformCanvas';
 
 interface InteractiveWaveformProps {
   title?: string;
@@ -13,6 +13,7 @@ interface InteractiveWaveformProps {
   currentTime: number;
   isPlaying: boolean;
   hasAudio: boolean;
+  isDark?: boolean;
   onTogglePlay: () => void;
   onSeek: (seconds: number, autoPlay?: boolean) => void;
 }
@@ -32,79 +33,43 @@ export function InteractiveWaveform({
   currentTime,
   isPlaying,
   hasAudio,
+  isDark = false,
   onTogglePlay,
   onSeek,
 }: InteractiveWaveformProps) {
-  const trackRef = useRef<HTMLDivElement | null>(null);
-  const [isScrubbing, setIsScrubbing] = useState(false);
   const [hoveredWordIdx, setHoveredWordIdx] = useState<number | null>(null);
-  const [hoverTimeSec, setHoverTimeSec] = useState<number | null>(null);
+  const [canvasHoverWordIdx, setCanvasHoverWordIdx] = useState<number | null>(null);
 
   const effectiveDuration = useMemo(() => {
     if (durationSec > 0) return durationSec;
     if (wordTimings.length > 0) {
-      return wordTimings[wordTimings.length - 1].endSeconds;
+      const last = wordTimings[wordTimings.length - 1];
+      return Math.max(0.2, last.endMs / 1000 || last.endSeconds || 1);
     }
     return 1;
   }, [durationSec, wordTimings]);
 
-  const bars = useMemo(() => {
-    if (Array.isArray(waveformPeaks) && waveformPeaks.length > 0) {
-      return waveformPeaks;
-    }
-    return buildFallbackWaveformPeaks(wordTimings, effectiveDuration, 110);
-  }, [waveformPeaks, wordTimings, effectiveDuration]);
-
   const activeWordIndex = useMemo(() => {
     if (wordTimings.length === 0) return -1;
-    // Direct match first
-    const direct = wordTimings.findIndex(
-      (w) => currentTime >= w.startSeconds && currentTime <= w.endSeconds
-    );
+    const currentMs = currentTime * 1000;
+    const direct = wordTimings.findIndex((w) => currentMs >= w.startMs && currentMs <= w.endMs);
     if (direct !== -1) return direct;
-    // Near edge tolerance while playing
     if (isPlaying && currentTime > 0) {
-      return wordTimings.findIndex(
-        (w) => currentTime >= w.startSeconds - 0.04 && currentTime <= w.endSeconds + 0.06
-      );
+      return wordTimings.findIndex((w) => currentMs >= w.startMs - 40 && currentMs <= w.endMs + 60);
     }
     return -1;
   }, [wordTimings, currentTime, isPlaying]);
 
+  const resolvedHoverIdx =
+    hoveredWordIdx !== null ? hoveredWordIdx : canvasHoverWordIdx;
+
   const hoveredWord =
-    hoveredWordIdx !== null && wordTimings[hoveredWordIdx]
-      ? wordTimings[hoveredWordIdx]
-      : hoverTimeSec !== null
-        ? wordTimings.find(
-            (w) => hoverTimeSec >= w.startSeconds && hoverTimeSec <= w.endSeconds
-          ) ?? null
-        : null;
+    resolvedHoverIdx !== null && wordTimings[resolvedHoverIdx]
+      ? wordTimings[resolvedHoverIdx]
+      : null;
 
   const activeWord = activeWordIndex >= 0 ? wordTimings[activeWordIndex] : null;
   const inspectedWord = hoveredWord ?? activeWord;
-
-  const progressPct = Math.min(100, Math.max(0, (currentTime / effectiveDuration) * 100));
-
-  const seekFromClientX = (clientX: number, autoPlay = false) => {
-    const el = trackRef.current;
-    if (!el || !hasAudio) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const nextSec = ratio * effectiveDuration;
-    setHoverTimeSec(nextSec);
-    onSeek(nextSec, autoPlay);
-  };
-
-  const highlightStartPct = inspectedWord
-    ? Math.max(0, (inspectedWord.startSeconds / effectiveDuration) * 100)
-    : null;
-  const highlightWidthPct = inspectedWord
-    ? Math.max(
-        0.6,
-        ((inspectedWord.endSeconds - inspectedWord.startSeconds) / effectiveDuration) * 100
-      )
-    : null;
 
   return (
     <section
@@ -151,8 +116,7 @@ export function InteractiveWaveform({
               data-testid="waveform-offset-readout"
               className="text-xs font-mono tabular-nums text-[#2563EB] dark:text-blue-400 bg-blue-50 dark:bg-blue-950/50 border border-blue-200/80 dark:border-blue-900 px-2.5 py-1 rounded-md whitespace-nowrap"
             >
-              “{inspectedWord.word}” · {formatPreciseSec(inspectedWord.startSeconds)} –{' '}
-              {formatPreciseSec(inspectedWord.endSeconds)}
+              “{inspectedWord.word}” · {inspectedWord.startMs}ms – {inspectedWord.endMs}ms
             </div>
           ) : (
             <div
@@ -169,120 +133,23 @@ export function InteractiveWaveform({
         </div>
       </div>
 
-      {/* Interactive Scrubbable Waveform */}
-      <div
-        ref={trackRef}
-        role="slider"
-        tabIndex={hasAudio ? 0 : -1}
-        aria-label="Interactive speech waveform scrubber"
-        aria-valuemin={0}
-        aria-valuemax={Number(effectiveDuration.toFixed(2))}
-        aria-valuenow={Number(currentTime.toFixed(2))}
-        data-testid="interactive-waveform-canvas"
-        onPointerDown={(e) => {
-          if (!hasAudio) return;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          setIsScrubbing(true);
-          seekFromClientX(e.clientX, false);
-        }}
-        onPointerMove={(e) => {
-          const el = trackRef.current;
-          if (!el) return;
-          const rect = el.getBoundingClientRect();
-          if (rect.width > 0) {
-            const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            setHoverTimeSec(ratio * effectiveDuration);
-          }
-          if (isScrubbing) {
-            seekFromClientX(e.clientX, false);
-          }
-        }}
-        onPointerUp={() => setIsScrubbing(false)}
-        onPointerCancel={() => setIsScrubbing(false)}
-        onPointerLeave={() => {
-          setIsScrubbing(false);
-          setHoverTimeSec(null);
-        }}
-        onKeyDown={(e) => {
-          if (!hasAudio) return;
-          if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            onSeek(Math.min(effectiveDuration, currentTime + 0.25), false);
-          } else if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            onSeek(Math.max(0, currentTime - 0.25), false);
-          } else if (e.key === ' ') {
-            e.preventDefault();
-            onTogglePlay();
-          }
-        }}
-        className="relative h-24 w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 px-2 flex items-center select-none cursor-pointer overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB]"
-      >
-        {/* Inspected / Active word span highlight */}
-        {highlightStartPct !== null && highlightWidthPct !== null && (
-          <div
-            aria-hidden="true"
-            style={{ left: `${highlightStartPct}%`, width: `${highlightWidthPct}%` }}
-            className="absolute inset-y-0 bg-[#2563EB]/12 dark:bg-blue-500/20 border-x border-[#2563EB]/40 pointer-events-none transition-all duration-75"
-          />
-        )}
-
-        {/* Word boundary ticks */}
-        {wordTimings.length > 0 && wordTimings.length <= 160 && (
-          <div aria-hidden="true" className="absolute inset-x-0 bottom-0 h-1.5 pointer-events-none">
-            {wordTimings.map((w, idx) => {
-              const leftPct = (w.startSeconds / effectiveDuration) * 100;
-              return (
-                <span
-                  key={`${w.word}-${idx}`}
-                  style={{ left: `${leftPct}%` }}
-                  className="absolute bottom-0 w-px h-1.5 bg-slate-300 dark:bg-slate-700"
-                />
-              );
-            })}
-          </div>
-        )}
-
-        {/* Amplitude Bars */}
-        <div
-          aria-hidden="true"
-          className="relative z-10 w-full h-16 flex items-center justify-between gap-[2px] pointer-events-none"
-        >
-          {bars.map((peak, idx) => {
-            const barCenterPct = ((idx + 0.5) / bars.length) * 100;
-            const isPlayed = barCenterPct <= progressPct;
-            const inHighlightedWord =
-              highlightStartPct !== null &&
-              highlightWidthPct !== null &&
-              barCenterPct >= highlightStartPct &&
-              barCenterPct <= highlightStartPct + highlightWidthPct;
-            const heightPct = Math.max(8, Math.min(100, Math.round(peak * 100)));
-
-            return (
-              <div
-                key={idx}
-                style={{ height: `${heightPct}%` }}
-                className={`flex-1 min-w-[2px] rounded-xs transition-colors duration-75 ${
-                  inHighlightedWord
-                    ? 'bg-[#0EA5E9] dark:bg-cyan-400'
-                    : isPlayed
-                      ? 'bg-[#2563EB] dark:bg-blue-500'
-                      : 'bg-slate-300 dark:bg-slate-700'
-                }`}
-              />
-            );
-          })}
-        </div>
-
-        {/* Playhead Cursor */}
-        <div
-          aria-hidden="true"
-          style={{ left: `${Math.min(99.2, Math.max(0.5, progressPct))}%` }}
-          className="absolute inset-y-0 w-0.5 bg-[#0F172A] dark:bg-white z-20 pointer-events-none"
-        >
-          <span className="absolute -top-0.5 -left-1 w-2.5 h-2.5 rounded-xs bg-[#0F172A] dark:bg-white" />
-        </div>
-      </div>
+      {/* Reusable HiDPI WaveformCanvas */}
+      <WaveformCanvas
+        testId="interactive-waveform-canvas"
+        ariaLabel="Interactive speech waveform scrubber"
+        waveformPeaks={waveformPeaks}
+        wordTimings={wordTimings}
+        durationSec={effectiveDuration}
+        currentTime={currentTime}
+        isPlaying={isPlaying}
+        hasAudio={hasAudio}
+        isDark={isDark}
+        height={92}
+        highlightedWordIndex={hoveredWordIdx}
+        onTogglePlay={onTogglePlay}
+        onSeek={onSeek}
+        onHoverWordChange={(wordIndex) => setCanvasHoverWordIdx(wordIndex)}
+      />
 
       {/* Synchronized Word-Timing Offset Strip */}
       {wordTimings.length > 0 && (
@@ -292,7 +159,7 @@ export function InteractiveWaveform({
         >
           {wordTimings.map((w, idx) => {
             const isActive = idx === activeWordIndex;
-            const isHovered = idx === hoveredWordIdx;
+            const isHovered = idx === resolvedHoverIdx;
             return (
               <button
                 key={`${w.word}-${w.startMs}-${idx}`}
@@ -300,13 +167,13 @@ export function InteractiveWaveform({
                 data-testid="waveform-word-token"
                 data-word-index={idx}
                 data-active={isActive ? 'true' : 'false'}
-                title={`${w.word}: ${formatPreciseSec(w.startSeconds)} – ${formatPreciseSec(w.endSeconds)} (${w.endMs - w.startMs}ms)`}
+                title={`${w.word}: ${w.startMs}ms – ${w.endMs}ms (${w.endMs - w.startMs}ms)`}
                 onMouseEnter={() => setHoveredWordIdx(idx)}
                 onMouseLeave={() => setHoveredWordIdx((cur) => (cur === idx ? null : cur))}
                 onFocus={() => setHoveredWordIdx(idx)}
                 onBlur={() => setHoveredWordIdx((cur) => (cur === idx ? null : cur))}
-                onClick={() => onSeek(w.startSeconds, true)}
-                className={`inline-flex items-baseline gap-1.5 px-2 py-1 rounded-md border text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB] ${
+                onClick={() => onSeek(w.startMs / 1000, true)}
+                className={`inline-flex items-baseline gap-1.5 px-2 py-1 rounded-md border text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB] ${
                   isActive
                     ? 'bg-[#2563EB] border-[#2563EB] text-white font-medium'
                     : isHovered
@@ -317,12 +184,10 @@ export function InteractiveWaveform({
                 <span>{w.word}</span>
                 <span
                   className={`text-[10px] font-mono tabular-nums ${
-                    isActive
-                      ? 'text-blue-100'
-                      : 'text-slate-400 dark:text-slate-500'
+                    isActive ? 'text-blue-100' : 'text-slate-400 dark:text-slate-500'
                   }`}
                 >
-                  {w.startSeconds.toFixed(2)}s
+                  {(w.startMs / 1000).toFixed(2)}s
                 </span>
               </button>
             );

@@ -32,18 +32,23 @@ import {
   translateSpeechScript,
 } from '../server/ttsService';
 import { filterVoices } from '../utils/speechLogic';
-import { generateSubtitles } from '../utils/subtitleGenerator';
-import type { GenerateResponsePayload, SubtitleFormat, SubtitlePreset } from '../types';
+import { generateSubtitles, generateWordLevelSrt } from '../utils/subtitleGenerator';
+import type {
+  GenerateResponsePayload,
+  SubtitleFormat,
+  SubtitleGranularity,
+  SubtitlePreset,
+} from '../types';
 
-export const SVARA_MCP_VERSION = '2.2.0';
-export const SVARA_MCP_BUILD = '2026-11-16.2';
+export const SVARA_MCP_VERSION = '2.3.0';
+export const SVARA_MCP_BUILD = '2026-11-16.3';
 
-const SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (हिन्दी), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
+const SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (हिन्दी), and Hinglish speech production server (MCP + OpenAPI/Plugin) for video creators, reels, documentaries, and podcasts.
 Recommended creator workflow:
 1. Discover voices via list_voices or inspect saved presets via list_voice_presets, and audition quickly with preview_voice.
 2. Register proper nouns or tricky words once with add_pronunciation so English and Hindi scripts speak them cleanly.
-3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordTimings, waveformPeaks, timingSource, timingConfidence, and speechEnvelope.
-4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions via generate_subtitles without re-transcribing.
+3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Automatic fallback routes seamlessly through Gemini -> OpenAI/ElevenLabs (if configured) -> zero-API-key unlimited Keyless TTS (modelTier: "keyless" also selects it directly). Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordSrtUrl, wordTimings (startMs/endMs), waveformPeaks, timingSource, timingConfidence, and speechEnvelope. Pass includeWordLevelSrt: true to also embed word-level .SRT inline.
+4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized phrase-level or word-level (granularity: "word" / wordLevel: true) .srt, .vtt, .ass (Rainbow Reels), or JSON captions via generate_subtitles without re-transcribing.
 5. Use localize_narration for simultaneous Hindi/Hinglish/English dubs, or pass existing files via audioFile/clipId to transcribe_audio, dub_audio, match_duration, analyze_voice, and replace_segment.`;
 
 function handleMcpToolError(error: unknown): CallToolResult {
@@ -78,6 +83,9 @@ function buildAudioToolResult(
   const base = publicBaseUrl.replace(/\/$/, '');
   const fullAudioUrl = `${base}${res.audioUrl}`;
   const fullDownloadUrl = `${base}${res.downloadUrl || `${res.audioUrl}?download=1`}`;
+  const fullWordSrtUrl = res.clipId
+    ? `${base}${res.wordSrtUrl || `/api/clips/${res.clipId}/subtitles/srt?granularity=word&download=1`}`
+    : undefined;
   const ext = res.format || 'wav';
   const fileName = `svara-${res.clipId}.${ext}`;
   const resourceUri = `svara://clips/${fileName}`;
@@ -95,12 +103,14 @@ function buildAudioToolResult(
       format: ext,
       sizeBytes: res.sizeBytes ?? 0,
       downloadUrl: fullDownloadUrl,
+      ...(fullWordSrtUrl ? { wordSrtUrl: fullWordSrtUrl } : {}),
       resourceUri,
       sampleRate: res.sampleRate ?? 48000,
       channels: res.channels ?? 1,
     },
     audioUrl: fullAudioUrl,
     downloadUrl: fullDownloadUrl,
+    ...(fullWordSrtUrl ? { wordSrtUrl: fullWordSrtUrl } : {}),
     mimeType: res.mimeType,
     format: ext,
     durationMs,
@@ -117,6 +127,7 @@ function buildAudioToolResult(
     appliedPronunciations: res.appliedPronunciations ?? [],
     ...(res.wordTimings ? { wordTimings: res.wordTimings } : {}),
     ...(res.phraseTimings ? { phraseTimings: res.phraseTimings } : {}),
+    ...(res.wordSrt ? { wordSrt: res.wordSrt } : {}),
     ...(res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {}),
     speechEnvelope: res.speechEnvelope ?? [],
     ...(res.segments ? { segments: res.segments } : {}),
@@ -375,7 +386,10 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe('Optional saved preset ID or name from list_voice_presets.'),
         language: z.enum(['en', 'hi', 'bilingual']).optional(),
-        modelTier: z.enum(['standard', 'expressive']).optional(),
+        modelTier: z
+          .enum(['standard', 'expressive', 'keyless'])
+          .optional()
+          .describe('Synthesis engine tier. "keyless" uses zero-API-key unlimited TTS directly; standard/expressive also auto-fallback to keyless when quotas are exhausted.'),
         stylePrompt: z.string().optional(),
         customVoiceDescription: z.string().optional(),
         speed: z.number().min(0.7).max(1.4).optional(),
@@ -399,6 +413,11 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         fitMode: z.enum(['natural', 'tight', 'stretch']).optional(),
         returnWordTimings: z.boolean().optional().default(true),
         returnWaveformPeaks: z.boolean().optional().default(true),
+        includeWordLevelSrt: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe('When true, also returns a word-level .SRT string (wordSrt) in structuredContent.'),
         projectId: z.string().optional(),
       },
     },
@@ -443,6 +462,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
           fitMode: args.fitMode,
           returnWordTimings: args.returnWordTimings,
           returnWaveformPeaks: args.returnWaveformPeaks,
+          includeWordLevelSrt: args.includeWordLevelSrt,
           projectId: args.projectId,
         });
 
@@ -462,9 +482,10 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         'Retrieve a previously generated Svara Studio clip by clipId, returning a fresh audio attachment, download URL, script, voiceUsed, modelUsed, durationMs, timingSource, timingConfidence, wordTimings, and waveformPeaks.',
       inputSchema: {
         clipId: z.string().min(1),
+        includeWordLevelSrt: z.boolean().optional().default(false),
       },
     },
-    async ({ clipId }) => {
+    async ({ clipId, includeWordLevelSrt }) => {
       try {
         const found = getClipAudioBuffer(clipId, false);
         if (!found) {
@@ -474,6 +495,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         const base = publicBaseUrl.replace(/\/$/, '');
         const audioUrl = `${base}/api/clips/${rec.id}.${found.ext}`;
         const downloadUrl = `${audioUrl}?download=1`;
+        const wordSrtUrl = `${base}/api/clips/${rec.id}/subtitles/srt?granularity=word&download=1`;
         const fileName = `svara-${rec.id}.${found.ext}`;
         const base64 = found.buffer.toString('base64');
 
@@ -481,6 +503,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
           clipId: rec.id,
           audioUrl,
           downloadUrl,
+          wordSrtUrl,
           mimeType: found.mimeType,
           format: found.ext,
           sizeBytes: found.buffer.length,
@@ -496,6 +519,9 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
           timingConfidence: rec.timingConfidence ?? 0.85,
           wordTimings: rec.wordTimings,
           phraseTimings: rec.phraseTimings,
+          ...(includeWordLevelSrt && rec.wordTimings?.length
+            ? { wordSrt: generateWordLevelSrt(rec.wordTimings) }
+            : {}),
           waveformPeaks: rec.waveformPeaks ?? [],
           speechEnvelope: rec.speechEnvelope,
           segments: rec.segments,
@@ -606,16 +632,26 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     }
   );
 
-  // 7. generate_subtitles
+  // 7. generate_subtitles (supports phrase-level & word-level SRT/VTT/ASS/JSON)
   server.registerTool(
     'generate_subtitles',
     {
-      title: 'Generate Synchronized Subtitles (.SRT, .VTT, .ASS, JSON)',
+      title: 'Generate Synchronized Subtitles (Phrase & Word-Level .SRT, .VTT, .ASS, JSON)',
       description:
-        'Generate time-aligned captions from a synthesized clipId based on duration and line constraints. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).',
+        'Generate time-aligned phrase or word-level captions from a synthesized clipId based on duration and line constraints. Set granularity: "word" (or wordLevel: true) with format: "srt" for word-by-word .SRT files. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).',
       inputSchema: {
         clipId: z.string(),
         format: z.enum(['srt', 'vtt', 'ass', 'json']).default('ass'),
+        granularity: z
+          .enum(['phrase', 'word'])
+          .optional()
+          .default('phrase')
+          .describe('Use "word" to emit one cue per spoken word (word-level SRT/VTT/ASS/JSON).'),
+        wordLevel: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe('Alias for granularity: "word".'),
         preset: z.enum(['rainbow_reels', 'clean_editorial']).default('rainbow_reels'),
         maxLines: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional().default(3),
         maxCharsPerLine: z.number().int().min(10).max(80).optional(),
@@ -627,6 +663,8 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
     async ({
       clipId,
       format,
+      granularity,
+      wordLevel,
       preset,
       maxLines,
       maxCharsPerLine,
@@ -639,9 +677,13 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
         if (!record) {
           throw new Error(`Clip '${clipId}' not found.`);
         }
+        const effectiveGranularity: SubtitleGranularity =
+          wordLevel || granularity === 'word' ? 'word' : 'phrase';
         const subtitleText = generateSubtitles({
           wordTimings: record.wordTimings,
           format: format as SubtitleFormat,
+          granularity: effectiveGranularity,
+          wordLevel: effectiveGranularity === 'word',
           preset: preset as SubtitlePreset,
           maxLines: maxLines as 1 | 2 | 3,
           maxCharsPerLine,
@@ -650,7 +692,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
           safeAreaMarginV,
         });
 
-        const downloadUrl = `${publicBaseUrl.replace(/\/$/, '')}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
+        const downloadUrl = `${publicBaseUrl.replace(/\/$/, '')}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&granularity=${effectiveGranularity}&download=1`;
         const mimeMap: Record<string, string> = {
           srt: 'application/x-subrip',
           vtt: 'text/vtt',
@@ -663,26 +705,27 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
             {
               type: 'resource_link',
               uri: downloadUrl,
-              name: `svara-${clipId}.${format}`,
-              title: `Subtitles (${preset}, ${format.toUpperCase()})`,
+              name: `svara-${clipId}${effectiveGranularity === 'word' ? '-words' : ''}.${format}`,
+              title: `Subtitles (${effectiveGranularity}, ${preset}, ${format.toUpperCase()})`,
               mimeType: mimeMap[format],
             },
             {
               type: 'resource',
               resource: {
-                uri: `svara://clips/${clipId}.${format}`,
+                uri: `svara://clips/${clipId}-${effectiveGranularity}.${format}`,
                 mimeType: mimeMap[format],
                 text: subtitleText,
               },
             },
             {
               type: 'text',
-              text: `Generated ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`,
+              text: `Generated ${effectiveGranularity}-level ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`,
             },
           ],
           structuredContent: {
             clipId,
             format,
+            granularity: effectiveGranularity,
             preset,
             maxLines,
             timingSource: record.timingSource || 'forced_alignment',
@@ -1158,6 +1201,7 @@ export function createSvaraMcpServer(publicBaseUrl: string): McpServer {
           audioUrl: `${base}${c.audioUrl}`,
           downloadUrl: `${base}${c.downloadUrl}`,
           srtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?download=1`,
+          wordSrtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?granularity=word&download=1`,
           assUrl: `${base}/api/clips/${c.clipId}/subtitles/ass?preset=rainbow_reels&download=1`,
         })),
       };

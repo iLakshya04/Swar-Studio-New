@@ -8,11 +8,11 @@ interface McpConnectPanelProps {
 const CREATOR_TOOLS_SUMMARY = [
   {
     name: 'generate_speech & get_clip',
-    summary: '48 kHz mono/stereo WAV, MP3/M4A/FLAC, native MCP audio attachment, forced-aligned wordTimings, waveformPeaks, multi-provider fallback, and clip retrieval',
+    summary: '48 kHz mono/stereo WAV, MP3/M4A/FLAC, native MCP audio attachment, forced-aligned wordTimings (startMs/endMs), waveformPeaks, wordSrtUrl, multi-provider fallback, and clip retrieval',
   },
   {
     name: 'generate_subtitles',
-    summary: 'Direct .SRT, .VTT, .ASS (Rainbow Reels white + cyan #00E5FF active word), and word-timing JSON with line/duration constraints',
+    summary: 'Phrase-level or word-level (granularity: "word") .SRT, .VTT, .ASS (Rainbow Reels white + cyan #00E5FF active word), and JSON with line/duration constraints',
   },
   {
     name: 'generate_speech_segments & regenerate_segment',
@@ -40,6 +40,8 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
 
   const activeMcpUrl = `${origin}/mcp`;
   const activeSseUrl = `${origin}/sse`;
+  const activeOpenApiUrl = `${origin}/openapi.json`;
+  const activePluginUrl = `${origin}/.well-known/ai-plugin.json`;
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isTesting, setIsTesting] = useState(false);
@@ -132,15 +134,15 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="space-y-1">
             <h2 className="text-base font-semibold text-[#0F172A] dark:text-slate-100">
-              Remote Creator Speech MCP Endpoints (v2.2.0)
+              Remote Creator Speech MCP &amp; ChatGPT Plugin Endpoints (v2.3.0)
             </h2>
             <p className="text-sm text-slate-500 dark:text-slate-400">
-              Returns native MCP audio attachments, file resource links, 48 kHz normalized WAVs, forced-aligned wordTimings, Rainbow Reels .ASS captions, and supports ChatGPT file uploads.
+              All 28 studio tools (48 kHz WAVs, forced-aligned startMs/endMs wordTimings, word-level .SRT &amp; Rainbow Reels .ASS captions, localization, and audio editing) exposed over MCP and OpenAPI / ChatGPT Plugin.
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <span className="text-xs font-mono text-emerald-700 dark:text-emerald-400">
-              Streamable HTTP Ready
+              MCP + OpenAPI Ready
             </span>
           </div>
         </div>
@@ -198,6 +200,64 @@ export function McpConnectPanel({ serverAppUrl }: McpConnectPanelProps) {
                   <>
                     <Copy className="w-3.5 h-3.5" />
                     <span>Copy SSE</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
+              OpenAPI 3.1 Spec (ChatGPT Actions / Plugins)
+            </span>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono text-[#0F172A] dark:text-slate-200 truncate">
+                {activeOpenApiUrl}
+              </code>
+              <button
+                type="button"
+                onClick={() => handleCopy('openapi-url', activeOpenApiUrl)}
+                aria-label="Copy OpenAPI spec URL"
+                className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                {copiedId === 'openapi-url' ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy OpenAPI</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
+              Plugin Manifest (ai-plugin.json)
+            </span>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono text-[#0F172A] dark:text-slate-200 truncate">
+                {activePluginUrl}
+              </code>
+              <button
+                type="button"
+                onClick={() => handleCopy('plugin-url', activePluginUrl)}
+                aria-label="Copy ai-plugin.json manifest URL"
+                className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0"
+              >
+                {copiedId === 'plugin-url' ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy Manifest</span>
                   </>
                 )}
               </button>
@@ -334,6 +394,40 @@ Auth: None`}
             >
               <Play className="w-3.5 h-3.5" />
               <span>Pronunciations</span>
+            </button>
+            <button
+              type="button"
+              disabled={isTesting}
+              onClick={async () => {
+                setIsTesting(true);
+                setTestError(null);
+                try {
+                  const res = await fetch('/openapi.json');
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                  setTestOutput(
+                    JSON.stringify(
+                      {
+                        openapi: data.openapi,
+                        version: data.info?.version,
+                        pathCount: Object.keys(data.paths || {}).length,
+                        paths: Object.keys(data.paths || {}),
+                      },
+                      null,
+                      2
+                    )
+                  );
+                } catch (err) {
+                  setTestError(err instanceof Error ? err.message : 'OpenAPI check failed');
+                } finally {
+                  setIsTesting(false);
+                }
+              }}
+              data-testid="test-openapi-btn"
+              className="inline-flex items-center gap-1.5 px-3 h-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-[#0F172A] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors whitespace-nowrap"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>Test OpenAPI</span>
             </button>
             <button
               type="button"

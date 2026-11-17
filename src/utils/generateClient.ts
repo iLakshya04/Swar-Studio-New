@@ -4,6 +4,7 @@ import type {
   WordTiming,
 } from '../types';
 import { validateGeneratePayload } from './speechLogic';
+import { alignWordsToEnvelope, generateWordLevelSrt } from './subtitleGenerator';
 
 export function normalizeWordTimings(timings?: WordTiming[]): WordTiming[] {
   if (!Array.isArray(timings) || timings.length === 0) {
@@ -85,30 +86,53 @@ export function buildFallbackWaveformPeaks(
 }
 
 export function normalizeGenerateResponse(
-  data: GenerateResponsePayload
+  data: GenerateResponsePayload,
+  fallbackText?: string,
+  options?: { includeWordLevelSrt?: boolean }
 ): GenerateResponsePayload {
-  const wordTimings = normalizeWordTimings(data.wordTimings);
-  const durationSeconds =
+  const durationMs =
     typeof data.durationMs === 'number' && data.durationMs > 0
-      ? data.durationMs / 1000
-      : data.durationEstimateSec || 0;
+      ? Math.round(data.durationMs)
+      : Math.max(200, Math.round((data.durationEstimateSec || 1) * 1000));
+
+  let wordTimings = normalizeWordTimings(data.wordTimings);
+  let timingSource = data.timingSource;
+  let timingConfidence = data.timingConfidence;
+
+  if (wordTimings.length === 0 && fallbackText && fallbackText.trim().length > 0) {
+    const fallbackAligned = alignWordsToEnvelope(fallbackText, durationMs, data.speechEnvelope);
+    wordTimings = fallbackAligned.wordTimings;
+    timingSource = timingSource || fallbackAligned.timingSource;
+    timingConfidence =
+      typeof timingConfidence === 'number' ? timingConfidence : fallbackAligned.timingConfidence;
+  }
+
+  const durationSeconds = durationMs / 1000;
 
   const waveformPeaks =
     Array.isArray(data.waveformPeaks) && data.waveformPeaks.length > 0
       ? data.waveformPeaks.map((p) => Number(Math.max(0.04, Math.min(1, Number(p) || 0.04)).toFixed(3)))
       : buildFallbackWaveformPeaks(wordTimings, durationSeconds, 120);
 
+  const wordSrt =
+    data.wordSrt ||
+    (options?.includeWordLevelSrt && wordTimings.length > 0
+      ? generateWordLevelSrt(wordTimings)
+      : undefined);
+
   return {
     ...data,
+    durationMs,
     voiceUsed: data.voiceUsed || data.voiceName,
-    timingSource: data.timingSource || (wordTimings.length > 0 ? 'forced_alignment' : 'estimated'),
+    timingSource: timingSource || (wordTimings.length > 0 ? 'forced_alignment' : 'estimated'),
     timingConfidence:
-      typeof data.timingConfidence === 'number'
-        ? data.timingConfidence
+      typeof timingConfidence === 'number'
+        ? timingConfidence
         : wordTimings.length > 0
           ? 0.84
           : 0.45,
     wordTimings,
+    ...(wordSrt ? { wordSrt } : {}),
     waveformPeaks,
   };
 }
@@ -158,7 +182,14 @@ export async function generate(
     throw buildClientError(data, 'Speech generation failed.');
   }
 
-  return normalizeGenerateResponse(data);
+  const fallbackText =
+    payload.mode === 'multi' && Array.isArray(payload.dialogueLines)
+      ? payload.dialogueLines.map((l) => l.text).join(' ')
+      : payload.text;
+
+  return normalizeGenerateResponse(data, fallbackText, {
+    includeWordLevelSrt: payload.includeWordLevelSrt,
+  });
 }
 
 export const generateSpeech = generate;
@@ -190,5 +221,5 @@ export async function regenerateSegment(
     throw buildClientError(data, 'Segment regeneration failed.');
   }
 
-  return normalizeGenerateResponse(data);
+  return normalizeGenerateResponse(data, params.text);
 }

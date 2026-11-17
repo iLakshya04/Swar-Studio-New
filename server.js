@@ -1,15 +1,11 @@
 // server.ts
 import "dotenv/config";
 import express from "express";
-import fs3 from "node:fs";
-import path3 from "node:path";
+import fs5 from "node:fs";
+import path5 from "node:path";
 import { fileURLToPath } from "node:url";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-
-// src/mcp/createSvaraMcpServer.ts
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 
 // src/data/voices.ts
 var VOICE_PRESETS = [
@@ -254,6 +250,10 @@ var VOICE_PRESETS = [
     portraitUrl: "/src/assets/images/voice_noir_narrator_1794826140228.jpg"
   }
 ];
+
+// src/mcp/createSvaraMcpServer.ts
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 
 // src/server/studioStore.ts
 import crypto from "node:crypto";
@@ -741,7 +741,24 @@ function applyPronunciationRules(text, rules, targetLanguage) {
 }
 
 // src/utils/speechLogic.ts
+var DEVANAGARI_REGEX = /[\u0900-\u097F]/g;
+var LATIN_WORD_REGEX = /[A-Za-z]{2,}/g;
 var VOCAL_TAG_REGEX = /(<[a-z]+>|\|[a-z]+\|)/i;
+function detectScriptLanguage(text) {
+  const cleaned = text.replace(/\[[A-Z_]{2,24}\]/g, "").replace(/<[^>]+>/g, "").replace(/\|[^|]+\|/g, "").trim();
+  if (!cleaned) {
+    return "en";
+  }
+  const devanagariMatches = cleaned.match(DEVANAGARI_REGEX) ?? [];
+  const latinMatches = cleaned.match(LATIN_WORD_REGEX) ?? [];
+  if (devanagariMatches.length > 0 && latinMatches.length > 1) {
+    return "bilingual";
+  }
+  if (devanagariMatches.length > 0) {
+    return "hi";
+  }
+  return "en";
+}
 function countWordsAndChars(text) {
   const chars = text.length;
   const plainText = text.replace(/\[[A-Z_]{2,24}\]/g, " ").replace(/<[^>]+>/g, " ").replace(/\|[^|]+\|/g, " ").trim();
@@ -775,6 +792,14 @@ function filterVoices(voices, query, languageFilter, categoryFilter) {
   });
 }
 function selectTtsModel(params) {
+  if (params.modelTier === "webspeech") {
+    return "webspeech:os-voice";
+  }
+  if (params.modelTier === "keyless") {
+    const combinedText = params.mode === "multi" && params.dialogueLines?.length ? params.dialogueLines.map((l) => l.text).join(" ") : params.text;
+    const lang = detectScriptLanguage(combinedText);
+    return lang === "en" ? "keyless:neural-tts" : "keyless:google-tts";
+  }
   if (params.mode === "multi" || params.modelTier === "expressive") {
     return "gemini-3.8-flash-tts";
   }
@@ -1251,14 +1276,55 @@ function formatAssTime(ms) {
   const cs = Math.floor(safe % 1e3 / 10);
   return `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
 }
+function generateWordLevelSrt(wordTimings, opts = {}) {
+  if (!Array.isArray(wordTimings) || wordTimings.length === 0) return "";
+  return wordTimings.filter((w) => w && typeof w.word === "string" && w.word.trim().length > 0).map((w, idx) => {
+    const startMs = Math.max(
+      0,
+      Math.round(Number.isFinite(w.startMs) ? w.startMs : (w.startSeconds || 0) * 1e3)
+    );
+    const rawEndMs = Math.round(
+      Number.isFinite(w.endMs) ? w.endMs : (w.endSeconds || 0) * 1e3
+    );
+    const endMs = Math.max(startMs + 20, rawEndMs);
+    const text = opts.uppercase ? w.word.trim().toUpperCase() : w.word.trim();
+    return `${idx + 1}
+${formatSrtTime(startMs)} --> ${formatSrtTime(endMs)}
+${text}`;
+  }).join("\n\n");
+}
 function generateSubtitles(opts) {
   const isRainbow = (opts.preset ?? "rainbow_reels") === "rainbow_reels";
-  const uppercase = opts.uppercase ?? isRainbow;
+  const isWordLevel = opts.granularity === "word" || opts.wordLevel === true;
+  const uppercase = opts.uppercase ?? (isRainbow && !isWordLevel);
   const maxLines = opts.maxLines ?? (isRainbow ? 3 : 2);
   const maxCharsPerLine = opts.maxCharsPerLine ?? (isRainbow ? 22 : 38);
   const maxPhraseDurationMs = opts.maxPhraseDurationMs ?? (typeof opts.maxDurationSeconds === "number" && opts.maxDurationSeconds > 0 ? Math.round(opts.maxDurationSeconds * 1e3) : isRainbow ? 2600 : 3800);
   const marginV = opts.safeAreaMarginV ?? (isRainbow ? 340 : 120);
-  const phrases = groupWordsIntoPhrases(opts.wordTimings, {
+  const phrases = isWordLevel ? opts.wordTimings.filter((w) => w && typeof w.word === "string" && w.word.trim().length > 0).map((w) => {
+    const sMs = Math.max(
+      0,
+      Math.round(Number.isFinite(w.startMs) ? w.startMs : (w.startSeconds || 0) * 1e3)
+    );
+    const eMs = Math.max(
+      sMs + 20,
+      Math.round(Number.isFinite(w.endMs) ? w.endMs : (w.endSeconds || 0) * 1e3)
+    );
+    return {
+      text: uppercase ? w.word.trim().toUpperCase() : w.word.trim(),
+      startMs: sMs,
+      endMs: eMs,
+      words: [
+        {
+          ...w,
+          startMs: sMs,
+          endMs: eMs,
+          startSeconds: Number((sMs / 1e3).toFixed(3)),
+          endSeconds: Number((eMs / 1e3).toFixed(3))
+        }
+      ]
+    };
+  }) : groupWordsIntoPhrases(opts.wordTimings, {
     maxLines,
     maxCharsPerLine,
     maxPhraseDurationMs,
@@ -1268,6 +1334,7 @@ function generateSubtitles(opts) {
     return JSON.stringify(
       {
         preset: opts.preset ?? "rainbow_reels",
+        granularity: isWordLevel ? "word" : "phrase",
         wordTimings: opts.wordTimings,
         phrases
       },
@@ -1331,227 +1398,12 @@ ${events.join("\n")}
 `;
 }
 
-// src/server/quotaError.ts
-var InputValidationError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.status = 400;
-    this.error_code = "INVALID_ARGUMENT";
-    this.retryable = false;
-    this.name = "InputValidationError";
-  }
-};
-var QuotaExhaustedError = class extends Error {
-  constructor(params) {
-    super(
-      params.message || "All configured TTS providers are currently unavailable. Enable billing or configure a fallback provider (OPENAI_API_KEY or ELEVENLABS_API_KEY) in Settings > Secrets."
-    );
-    this.status = 429;
-    this.error_code = "RESOURCE_EXHAUSTED";
-    this.retryable = true;
-    this.name = "QuotaExhaustedError";
-    this.attemptedModels = params.attemptedModels;
-    this.retryAfterSeconds = typeof params.retryAfterSeconds === "number" && params.retryAfterSeconds > 0 ? Math.round(params.retryAfterSeconds) : 3600;
-  }
-  toPayload() {
-    return {
-      status: 429,
-      error_code: "RESOURCE_EXHAUSTED",
-      retryable: true,
-      retryAfterSeconds: this.retryAfterSeconds,
-      attemptedModels: this.attemptedModels,
-      message: this.message
-    };
-  }
-};
-var modelCooldownUntil = /* @__PURE__ */ new Map();
-function markModelCooldown(model, retryAfterSeconds) {
-  const safeSeconds = Math.max(15, Math.min(86400, Math.round(retryAfterSeconds || 60)));
-  modelCooldownUntil.set(model, Date.now() + safeSeconds * 1e3);
-}
-function isModelOnCooldown(model) {
-  const until = modelCooldownUntil.get(model);
-  if (!until) return false;
-  if (Date.now() >= until) {
-    modelCooldownUntil.delete(model);
-    return false;
-  }
-  return true;
-}
-function getModelCooldownRemainingSec(model) {
-  const until = modelCooldownUntil.get(model);
-  if (!until) return 0;
-  return Math.max(0, Math.ceil((until - Date.now()) / 1e3));
-}
-function parseJsonSafe(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-    const idx = trimmed.indexOf("{");
-    if (idx === -1) return null;
-    try {
-      return JSON.parse(trimmed.slice(idx));
-    } catch {
-      return null;
-    }
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-}
-function collectErrorNodes(err) {
-  const nodes = [];
-  const queue = [err];
-  const seen = /* @__PURE__ */ new Set();
-  while (queue.length > 0 && nodes.length < 40) {
-    const cur = queue.shift();
-    if (!cur || seen.has(cur)) continue;
-    if (typeof cur === "string") {
-      nodes.push(cur);
-      const parsed = parseJsonSafe(cur);
-      if (parsed && typeof parsed === "object") {
-        queue.push(parsed);
-      }
-      continue;
-    }
-    if (typeof cur !== "object") continue;
-    seen.add(cur);
-    const obj = cur;
-    nodes.push(obj);
-    if (typeof obj.message === "string") {
-      nodes.push(obj.message);
-      const parsed = parseJsonSafe(obj.message);
-      if (parsed && typeof parsed === "object") {
-        queue.push(parsed);
-      }
-    }
-    if (obj.error) queue.push(obj.error);
-    if (obj.cause) queue.push(obj.cause);
-    if (obj.response) queue.push(obj.response);
-    if (obj.data) queue.push(obj.data);
-    if (obj.body) queue.push(obj.body);
-    if (Array.isArray(obj.details)) {
-      for (const d of obj.details) queue.push(d);
-    }
-  }
-  return nodes;
-}
-function isQuotaOrRateError(err) {
-  if (err instanceof QuotaExhaustedError) return true;
-  const nodes = collectErrorNodes(err);
-  for (const node of nodes) {
-    if (typeof node === "string") {
-      const lower = node.toLowerCase();
-      if (lower.includes("resource_exhausted") || lower.includes("quota") || lower.includes("rate limit") || lower.includes("rate_limit") || lower.includes("too many requests") || /\b429\b/.test(lower)) {
-        return true;
-      }
-      continue;
-    }
-    const status = node.status;
-    const code = node.code ?? node.statusCode;
-    const reason = typeof node.reason === "string" ? node.reason.toUpperCase() : "";
-    const errCode = typeof node.error_code === "string" ? node.error_code.toUpperCase() : "";
-    if (status === 429 || code === 429 || code === "429") return true;
-    if (typeof status === "string" && status.toUpperCase() === "RESOURCE_EXHAUSTED") return true;
-    if (errCode === "RESOURCE_EXHAUSTED") return true;
-    if (reason.includes("QUOTA") || reason.includes("RATE_LIMIT")) return true;
-  }
-  return false;
-}
-function extractRetryAfterSeconds(err) {
-  const nodes = collectErrorNodes(err);
-  for (const node of nodes) {
-    if (typeof node === "string") {
-      const retryMatch = node.match(/retry\s+in\s+(\d+(?:\.\d+)?)\s*s/i) || node.match(/retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)s?/i) || node.match(/retryAfterSeconds["']?\s*[:=]\s*(\d+)/i);
-      if (retryMatch) {
-        const val = Math.ceil(Number(retryMatch[1]));
-        if (Number.isFinite(val) && val > 0) return val;
-      }
-      continue;
-    }
-    if (typeof node.retryAfterSeconds === "number" && node.retryAfterSeconds > 0) {
-      return Math.ceil(node.retryAfterSeconds);
-    }
-    if (typeof node.retryDelay === "string") {
-      const match = node.retryDelay.match(/(\d+(?:\.\d+)?)/);
-      if (match) {
-        const val = Math.ceil(Number(match[1]));
-        if (Number.isFinite(val) && val > 0) return val;
-      }
-    }
-    if (node.headers && typeof node.headers === "object") {
-      const headers = node.headers;
-      const ra = headers["retry-after"] ?? headers["Retry-After"];
-      if (typeof ra === "string" || typeof ra === "number") {
-        const val = Math.ceil(Number(ra));
-        if (Number.isFinite(val) && val > 0) return val;
-      }
-    }
-  }
-  const fullText = nodes.filter((n) => typeof n === "string").join(" ").toLowerCase();
-  if (fullText.includes("perday") || fullText.includes("per_day") || fullText.includes("daily")) {
-    return 3600;
-  }
-  return 60;
-}
-function mapApiError(error) {
-  if (error instanceof QuotaExhaustedError) {
-    return error.toPayload();
-  }
-  if (error instanceof InputValidationError) {
-    return {
-      status: 400,
-      error_code: "INVALID_ARGUMENT",
-      retryable: false,
-      message: error.message
-    };
-  }
-  const errObj = error;
-  const rawMessage = errObj?.message || "An unexpected speech synthesis error occurred.";
-  if (isQuotaOrRateError(error)) {
-    const retryAfterSeconds = extractRetryAfterSeconds(error);
-    return {
-      status: 429,
-      error_code: "RESOURCE_EXHAUSTED",
-      retryable: true,
-      retryAfterSeconds,
-      attemptedModels: Array.isArray(errObj?.attemptedModels) ? errObj.attemptedModels : void 0,
-      message: "All configured TTS providers are currently unavailable due to API quota or rate limits. Enable billing on your Google AI project or add a fallback provider key in Settings > Secrets."
-    };
-  }
-  if (rawMessage.includes("GEMINI_API_KEY")) {
-    return {
-      status: 400,
-      error_code: "INVALID_ARGUMENT",
-      retryable: false,
-      message: rawMessage
-    };
-  }
-  const numericStatus = typeof errObj?.status === "number" ? errObj.status : typeof errObj?.code === "number" ? errObj.code : 500;
-  if (numericStatus === 403 || rawMessage.includes("PERMISSION_DENIED") || rawMessage.includes("API_KEY_INVALID")) {
-    return {
-      status: 403,
-      error_code: "PERMISSION_DENIED",
-      retryable: false,
-      message: "Gemini API authentication failed. Please verify your key in Settings > Secrets."
-    };
-  }
-  if (numericStatus === 400 || rawMessage.includes("INVALID_ARGUMENT")) {
-    return {
-      status: 400,
-      error_code: "INVALID_ARGUMENT",
-      retryable: false,
-      message: rawMessage
-    };
-  }
-  return {
-    status: numericStatus >= 400 && numericStatus < 600 ? numericStatus : 500,
-    error_code: "INTERNAL",
-    retryable: numericStatus >= 500,
-    message: rawMessage
-  };
-}
+// src/server/keylessTts.ts
+import { execFile as execFile2 } from "node:child_process";
+import fs3 from "node:fs/promises";
+import os2 from "node:os";
+import path3 from "node:path";
+import { promisify as promisify2 } from "node:util";
 
 // src/server/wavAudio.ts
 import { execFile } from "node:child_process";
@@ -1987,13 +1839,530 @@ async function transcodeWavToFormat(wavBuffer, format, bitrateKbps = 192) {
   }
 }
 
-// src/server/ttsService.ts
-function getGeminiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is not configured. Please add your API key in Settings > Secrets."
+// src/server/keylessTts.ts
+var execFileAsync2 = promisify2(execFile2);
+var DEVANAGARI_CHAR = /[\u0900-\u097F]/;
+var DEVANAGARI_GLOBAL = /[\u0900-\u097F]/g;
+function stripTagsForKeylessTts(text) {
+  return text.replace(/\[[A-Z_]{2,24}\]\s*/g, "").replace(/<(?:breath|sigh|pause)>/gi, ", ").replace(/<[^>]+>/g, " ").replace(/\|(yeah|mhm|okay|right)\|/gi, "$1, ").replace(/\|[^|]+\|/g, " ").replace(/\s*,\s*,+/g, ", ").replace(/\s+/g, " ").trim();
+}
+function splitTextForKeylessChunks(rawText, language = "en", maxChars = 175) {
+  const cleaned = stripTagsForKeylessTts(rawText);
+  if (!cleaned) return [];
+  const clauses = [];
+  if (language === "hi" && !/[A-Za-z]{2,}/.test(cleaned)) {
+    clauses.push({ text: cleaned, langHint: "hi" });
+  } else if (language === "en" && !DEVANAGARI_CHAR.test(cleaned)) {
+    clauses.push({ text: cleaned, langHint: "en" });
+  } else {
+    const tokens = cleaned.split(/\s+/).filter(Boolean);
+    let currentLang = DEVANAGARI_CHAR.test(tokens[0] || "") ? "hi" : "en";
+    let currentTokens = [];
+    for (const token of tokens) {
+      const hasDev = DEVANAGARI_CHAR.test(token);
+      const hasLat = /[A-Za-z]/.test(token);
+      const tokenLang = hasDev ? "hi" : hasLat ? "en" : currentLang;
+      if (tokenLang !== currentLang && currentTokens.length > 0) {
+        clauses.push({ text: currentTokens.join(" "), langHint: currentLang });
+        currentTokens = [token];
+        currentLang = tokenLang;
+      } else {
+        currentTokens.push(token);
+      }
+    }
+    if (currentTokens.length > 0) {
+      clauses.push({ text: currentTokens.join(" "), langHint: currentLang });
+    }
+  }
+  const finalChunks = [];
+  for (const clause of clauses) {
+    if (clause.text.length <= maxChars) {
+      finalChunks.push(clause);
+      continue;
+    }
+    const sentences = clause.text.split(/(?<=[.!?।,;:])\s+/u).map((s) => s.trim()).filter(Boolean);
+    let buf = "";
+    for (const sentence of sentences) {
+      if (sentence.length > maxChars) {
+        if (buf) {
+          finalChunks.push({ text: buf, langHint: clause.langHint });
+          buf = "";
+        }
+        const words = sentence.split(/\s+/);
+        let wordBuf = "";
+        for (const w of words) {
+          if (w.length > maxChars) {
+            if (wordBuf) {
+              finalChunks.push({ text: wordBuf, langHint: clause.langHint });
+              wordBuf = "";
+            }
+            for (let i = 0; i < w.length; i += maxChars) {
+              finalChunks.push({ text: w.slice(i, i + maxChars), langHint: clause.langHint });
+            }
+            continue;
+          }
+          const cand = wordBuf ? `${wordBuf} ${w}` : w;
+          if (cand.length <= maxChars) {
+            wordBuf = cand;
+          } else {
+            if (wordBuf) finalChunks.push({ text: wordBuf, langHint: clause.langHint });
+            wordBuf = w;
+          }
+        }
+        if (wordBuf) {
+          finalChunks.push({ text: wordBuf, langHint: clause.langHint });
+        }
+        continue;
+      }
+      const candidate = buf ? `${buf} ${sentence}` : sentence;
+      if (candidate.length <= maxChars) {
+        buf = candidate;
+      } else {
+        if (buf) finalChunks.push({ text: buf, langHint: clause.langHint });
+        buf = sentence;
+      }
+    }
+    if (buf) {
+      finalChunks.push({ text: buf, langHint: clause.langHint });
+    }
+  }
+  return finalChunks;
+}
+var PERSONA_KEYLESS_MAP = {
+  ethan: { tiktokVoice: "en_male_narration", googleEnglishLang: "en-US", pitchFactor: 0.93 },
+  marcus: { tiktokVoice: "en_male_narration", googleEnglishLang: "en-US", pitchFactor: 0.87 },
+  julian: { tiktokVoice: "en_us_006", googleEnglishLang: "en-US", pitchFactor: 0.91 },
+  devon: { tiktokVoice: "en_us_007", googleEnglishLang: "en-US", pitchFactor: 0.97, speedMultiplier: 1.06 },
+  noah: { tiktokVoice: "en_us_006", googleEnglishLang: "en-US", pitchFactor: 1.03, speedMultiplier: 1.05 },
+  arthur: { tiktokVoice: "en_uk_003", googleEnglishLang: "en-GB", pitchFactor: 0.94 },
+  clara: { tiktokVoice: "en_uk_001", googleEnglishLang: "en-GB", pitchFactor: 0.99 },
+  elena: { tiktokVoice: "en_female_emotional", googleEnglishLang: "en-US", pitchFactor: 0.98 },
+  maya: { tiktokVoice: "en_us_001", googleEnglishLang: "en-US", pitchFactor: 1.02 },
+  riya: { tiktokVoice: "en_us_001", googleEnglishLang: "en-IN", pitchFactor: 1.04 },
+  ananya: { tiktokVoice: "en_female_emotional", googleEnglishLang: "en-IN", pitchFactor: 1 },
+  meera: { tiktokVoice: "en_uk_001", googleEnglishLang: "en-IN", pitchFactor: 0.98 },
+  aarav: { tiktokVoice: "en_male_narration", googleEnglishLang: "en-IN", pitchFactor: 0.92 },
+  vikram: { tiktokVoice: "en_us_006", googleEnglishLang: "en-IN", pitchFactor: 0.94 },
+  kabir: { tiktokVoice: "en_male_narration", googleEnglishLang: "en-IN", pitchFactor: 0.91 },
+  rohan: { tiktokVoice: "en_male_narration", googleEnglishLang: "en-IN", pitchFactor: 0.89 }
+};
+function resolveKeylessVoiceProfile(params) {
+  const preset = VOICE_PRESETS.find((v) => v.id === params.voiceId) ?? VOICE_PRESETS.find((v) => v.baseVoice === params.voiceName);
+  const mapped = preset ? PERSONA_KEYLESS_MAP[preset.id] : void 0;
+  let tiktokVoice = mapped?.tiktokVoice;
+  if (!tiktokVoice) {
+    if (params.voiceName === "Charon" || params.voiceName === "Fenrir") {
+      tiktokVoice = "en_male_narration";
+    } else if (params.voiceName === "Puck") {
+      tiktokVoice = "en_us_006";
+    } else if (params.voiceName === "Zephyr") {
+      tiktokVoice = "en_us_001";
+    } else {
+      tiktokVoice = "en_female_emotional";
+    }
+  }
+  let googleEnglishLang = mapped?.googleEnglishLang || "en-US";
+  if (!mapped?.googleEnglishLang && params.language === "bilingual") {
+    googleEnglishLang = "en-IN";
+  }
+  let pitchFactor = mapped?.pitchFactor ?? 1;
+  if (params.pitchRegister === "deep") {
+    pitchFactor *= 0.92;
+  } else if (params.pitchRegister === "bright") {
+    pitchFactor *= 1.08;
+  }
+  pitchFactor = Math.max(0.78, Math.min(1.22, Number(pitchFactor.toFixed(3))));
+  return {
+    tiktokVoice,
+    googleEnglishLang,
+    pitchFactor,
+    speedMultiplier: mapped?.speedMultiplier ?? 1
+  };
+}
+async function decodeMp3ToMonoWav(mp3Buffer, options = {}) {
+  const tmpDir = await fs3.mkdtemp(path3.join(os2.tmpdir(), "svara-keyless-"));
+  const inPath = path3.join(tmpDir, "chunk.mp3");
+  const outPath = path3.join(tmpDir, "chunk.wav");
+  try {
+    await fs3.writeFile(inPath, mp3Buffer);
+    const pitch = Math.max(0.78, Math.min(1.22, options.pitchFactor ?? 1));
+    const speed = clampSpeed(options.speed ?? 1);
+    const atempoVal = Math.max(0.55, Math.min(1.85, speed / pitch));
+    const filters = [];
+    if (Math.abs(pitch - 1) >= 0.015) {
+      filters.push(`asetrate=24000*${pitch.toFixed(4)}`, "aresample=24000");
+    }
+    if (Math.abs(atempoVal - 1) >= 0.015) {
+      filters.push(`atempo=${atempoVal.toFixed(4)}`);
+    }
+    const args = ["-y", "-i", inPath];
+    if (filters.length > 0) {
+      args.push("-af", filters.join(","));
+    }
+    args.push("-ar", "24000", "-ac", "1", "-f", "wav", outPath);
+    await execFileAsync2("ffmpeg", args, { timeout: 2e4 });
+    return await fs3.readFile(outPath);
+  } finally {
+    await fs3.rm(tmpDir, { recursive: true, force: true }).catch(() => {
+    });
+  }
+}
+async function synthesizeKeylessNeuralTts(params) {
+  const lang = params.language || "en";
+  if (lang === "hi" || DEVANAGARI_GLOBAL.test(params.text)) {
+    const err = new Error("Keyless neural English TTS does not speak Devanagari directly.");
+    err.status = 400;
+    throw err;
+  }
+  const profile = resolveKeylessVoiceProfile(params);
+  const chunks = splitTextForKeylessChunks(params.text, "en", 220);
+  if (chunks.length === 0) {
+    throw new Error("No speakable text after stripping tags.");
+  }
+  const chunkWavs = [];
+  const effectiveSpeed = clampSpeed((params.speed ?? 1) * profile.speedMultiplier);
+  let subtlePitch = 1;
+  if (params.pitchRegister === "deep") subtlePitch = 0.93;
+  else if (params.pitchRegister === "bright") subtlePitch = 1.07;
+  for (const chunk of chunks) {
+    const res = await fetch("https://tiktok-tts.weilnet.workers.dev/api/generation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: chunk.text,
+        voice: profile.tiktokVoice
+      }),
+      signal: AbortSignal.timeout(12e3)
+    });
+    if (!res.ok) {
+      const err = new Error(`Keyless neural TTS failed (${res.status}).`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    if (!data.success || !data.data) {
+      const err = new Error(data.error || "Keyless neural TTS returned no audio.");
+      err.status = 502;
+      throw err;
+    }
+    const mp3Buffer = Buffer.from(data.data, "base64");
+    const wav = await decodeMp3ToMonoWav(mp3Buffer, {
+      pitchFactor: subtlePitch,
+      speed: effectiveSpeed
+    });
+    chunkWavs.push(wav);
+  }
+  if (chunkWavs.length === 1) {
+    return chunkWavs[0];
+  }
+  return stitchWavBuffers(chunkWavs, 90, 24e3, 1).wavBuffer;
+}
+async function synthesizeKeylessGoogleTts(params) {
+  const langMode = params.language || (DEVANAGARI_CHAR.test(params.text) ? "hi" : "en");
+  const profile = resolveKeylessVoiceProfile(params);
+  const chunks = splitTextForKeylessChunks(params.text, langMode, 175);
+  if (chunks.length === 0) {
+    throw new Error("No speakable text after stripping tags.");
+  }
+  const chunkWavs = [];
+  const effectiveSpeed = clampSpeed((params.speed ?? 1) * profile.speedMultiplier);
+  for (const chunk of chunks) {
+    const tl = chunk.langHint === "hi" ? "hi" : profile.googleEnglishLang;
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${encodeURIComponent(
+      tl
+    )}&q=${encodeURIComponent(chunk.text)}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        Referer: "https://translate.google.com/"
+      },
+      signal: AbortSignal.timeout(12e3)
+    });
+    if (!res.ok) {
+      const err = new Error(`Keyless Google TTS failed (${res.status}).`);
+      err.status = res.status;
+      throw err;
+    }
+    const mp3Buffer = Buffer.from(await res.arrayBuffer());
+    if (mp3Buffer.length < 256) {
+      const err = new Error("Keyless Google TTS returned empty audio.");
+      err.status = 502;
+      throw err;
+    }
+    const wav = await decodeMp3ToMonoWav(mp3Buffer, {
+      pitchFactor: profile.pitchFactor,
+      speed: effectiveSpeed
+    });
+    chunkWavs.push(wav);
+  }
+  if (chunkWavs.length === 1) {
+    return chunkWavs[0];
+  }
+  return stitchWavBuffers(chunkWavs, 85, 24e3, 1).wavBuffer;
+}
+async function translateScriptKeyless(text, targetLanguage) {
+  const sourceLang = DEVANAGARI_CHAR.test(text) ? "hi" : "en";
+  const targetLang = targetLanguage === "en" ? "en" : "hi";
+  if (sourceLang === targetLang && targetLanguage !== "bilingual") {
+    return text.trim();
+  }
+  const tagMatches = [];
+  const tokenized = text.trim().replace(/(\[[A-Z_]{2,24}\]|<[^>]+>|\|[^|]+\|)/g, (match) => {
+    const idx = tagMatches.length;
+    tagMatches.push(match);
+    return `[[SVARA_TAG_${idx}]]`;
+  });
+  const sentences = tokenized.split(/(?<=[.!?।])\s+/u).filter(Boolean);
+  const translatedParts = [];
+  for (const sentence of sentences) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(
+      sentence.slice(0, 480)
+    )}&langpair=${sourceLang}|${targetLang}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8e3) });
+    if (!res.ok) {
+      throw new Error(`Keyless translation failed (${res.status}).`);
+    }
+    const json = await res.json();
+    const part = json?.responseData?.translatedText?.trim();
+    if (!part) {
+      throw new Error("Keyless translation returned empty text.");
+    }
+    translatedParts.push(part);
+  }
+  let result = translatedParts.join(" ");
+  for (let i = 0; i < tagMatches.length; i += 1) {
+    result = result.replace(new RegExp(`\\[\\[\\s*SVARA_TAG_${i}\\s*\\]\\]`, "gi"), tagMatches[i]);
+  }
+  return result.replace(/\s+/g, " ").trim();
+}
+
+// src/server/quotaError.ts
+var InputValidationError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.status = 400;
+    this.error_code = "INVALID_ARGUMENT";
+    this.retryable = false;
+    this.name = "InputValidationError";
+  }
+};
+var QuotaExhaustedError = class extends Error {
+  constructor(params) {
+    super(
+      params.message || "All configured TTS providers are currently unavailable. Enable billing or configure a fallback provider (OPENAI_API_KEY or ELEVENLABS_API_KEY) in Settings > Secrets."
     );
+    this.status = 429;
+    this.error_code = "RESOURCE_EXHAUSTED";
+    this.retryable = true;
+    this.name = "QuotaExhaustedError";
+    this.attemptedModels = params.attemptedModels;
+    this.retryAfterSeconds = typeof params.retryAfterSeconds === "number" && params.retryAfterSeconds > 0 ? Math.round(params.retryAfterSeconds) : 3600;
+  }
+  toPayload() {
+    return {
+      status: 429,
+      error_code: "RESOURCE_EXHAUSTED",
+      retryable: true,
+      retryAfterSeconds: this.retryAfterSeconds,
+      attemptedModels: this.attemptedModels,
+      message: this.message
+    };
+  }
+};
+var modelCooldownUntil = /* @__PURE__ */ new Map();
+function markModelCooldown(model, retryAfterSeconds) {
+  const safeSeconds = Math.max(15, Math.min(86400, Math.round(retryAfterSeconds || 60)));
+  modelCooldownUntil.set(model, Date.now() + safeSeconds * 1e3);
+}
+function isModelOnCooldown(model) {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldownUntil.delete(model);
+    return false;
+  }
+  return true;
+}
+function getModelCooldownRemainingSec(model) {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1e3));
+}
+function parseJsonSafe(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+    const idx = trimmed.indexOf("{");
+    if (idx === -1) return null;
+    try {
+      return JSON.parse(trimmed.slice(idx));
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+function collectErrorNodes(err) {
+  const nodes = [];
+  const queue = [err];
+  const seen = /* @__PURE__ */ new Set();
+  while (queue.length > 0 && nodes.length < 40) {
+    const cur = queue.shift();
+    if (!cur || seen.has(cur)) continue;
+    if (typeof cur === "string") {
+      nodes.push(cur);
+      const parsed = parseJsonSafe(cur);
+      if (parsed && typeof parsed === "object") {
+        queue.push(parsed);
+      }
+      continue;
+    }
+    if (typeof cur !== "object") continue;
+    seen.add(cur);
+    const obj = cur;
+    nodes.push(obj);
+    if (typeof obj.message === "string") {
+      nodes.push(obj.message);
+      const parsed = parseJsonSafe(obj.message);
+      if (parsed && typeof parsed === "object") {
+        queue.push(parsed);
+      }
+    }
+    if (obj.error) queue.push(obj.error);
+    if (obj.cause) queue.push(obj.cause);
+    if (obj.response) queue.push(obj.response);
+    if (obj.data) queue.push(obj.data);
+    if (obj.body) queue.push(obj.body);
+    if (Array.isArray(obj.details)) {
+      for (const d of obj.details) queue.push(d);
+    }
+  }
+  return nodes;
+}
+function isQuotaOrRateError(err) {
+  if (err instanceof QuotaExhaustedError) return true;
+  const nodes = collectErrorNodes(err);
+  for (const node of nodes) {
+    if (typeof node === "string") {
+      const lower = node.toLowerCase();
+      if (lower.includes("resource_exhausted") || lower.includes("quota") || lower.includes("rate limit") || lower.includes("rate_limit") || lower.includes("too many requests") || /\b429\b/.test(lower)) {
+        return true;
+      }
+      continue;
+    }
+    const status = node.status;
+    const code = node.code ?? node.statusCode;
+    const reason = typeof node.reason === "string" ? node.reason.toUpperCase() : "";
+    const errCode = typeof node.error_code === "string" ? node.error_code.toUpperCase() : "";
+    if (status === 429 || code === 429 || code === "429") return true;
+    if (typeof status === "string" && status.toUpperCase() === "RESOURCE_EXHAUSTED") return true;
+    if (errCode === "RESOURCE_EXHAUSTED") return true;
+    if (reason.includes("QUOTA") || reason.includes("RATE_LIMIT")) return true;
+  }
+  return false;
+}
+function extractRetryAfterSeconds(err) {
+  const nodes = collectErrorNodes(err);
+  for (const node of nodes) {
+    if (typeof node === "string") {
+      const retryMatch = node.match(/retry\s+in\s+(\d+(?:\.\d+)?)\s*s/i) || node.match(/retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)s?/i) || node.match(/retryAfterSeconds["']?\s*[:=]\s*(\d+)/i);
+      if (retryMatch) {
+        const val = Math.ceil(Number(retryMatch[1]));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+      continue;
+    }
+    if (typeof node.retryAfterSeconds === "number" && node.retryAfterSeconds > 0) {
+      return Math.ceil(node.retryAfterSeconds);
+    }
+    if (typeof node.retryDelay === "string") {
+      const match = node.retryDelay.match(/(\d+(?:\.\d+)?)/);
+      if (match) {
+        const val = Math.ceil(Number(match[1]));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+    }
+    if (node.headers && typeof node.headers === "object") {
+      const headers = node.headers;
+      const ra = headers["retry-after"] ?? headers["Retry-After"];
+      if (typeof ra === "string" || typeof ra === "number") {
+        const val = Math.ceil(Number(ra));
+        if (Number.isFinite(val) && val > 0) return val;
+      }
+    }
+  }
+  const fullText = nodes.filter((n) => typeof n === "string").join(" ").toLowerCase();
+  if (fullText.includes("perday") || fullText.includes("per_day") || fullText.includes("daily")) {
+    return 3600;
+  }
+  return 60;
+}
+function mapApiError(error) {
+  if (error instanceof QuotaExhaustedError) {
+    return error.toPayload();
+  }
+  if (error instanceof InputValidationError) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: error.message
+    };
+  }
+  const errObj = error;
+  const rawMessage = errObj?.message || "An unexpected speech synthesis error occurred.";
+  if (isQuotaOrRateError(error)) {
+    const retryAfterSeconds = extractRetryAfterSeconds(error);
+    return {
+      status: 429,
+      error_code: "RESOURCE_EXHAUSTED",
+      retryable: true,
+      retryAfterSeconds,
+      attemptedModels: Array.isArray(errObj?.attemptedModels) ? errObj.attemptedModels : void 0,
+      message: "All configured TTS providers are currently unavailable due to API quota or rate limits. Enable billing on your Google AI project or add a fallback provider key in Settings > Secrets."
+    };
+  }
+  if (rawMessage.includes("GEMINI_API_KEY")) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: rawMessage
+    };
+  }
+  const numericStatus = typeof errObj?.status === "number" ? errObj.status : typeof errObj?.code === "number" ? errObj.code : 500;
+  if (numericStatus === 403 || rawMessage.includes("PERMISSION_DENIED") || rawMessage.includes("API_KEY_INVALID")) {
+    return {
+      status: 403,
+      error_code: "PERMISSION_DENIED",
+      retryable: false,
+      message: "Gemini API authentication failed. Please verify your key in Settings > Secrets."
+    };
+  }
+  if (numericStatus === 400 || rawMessage.includes("INVALID_ARGUMENT")) {
+    return {
+      status: 400,
+      error_code: "INVALID_ARGUMENT",
+      retryable: false,
+      message: rawMessage
+    };
+  }
+  return {
+    status: numericStatus >= 400 && numericStatus < 600 ? numericStatus : 500,
+    error_code: "INTERNAL",
+    retryable: numericStatus >= 500,
+    message: rawMessage
+  };
+}
+
+// src/server/ttsService.ts
+function getGeminiClientOptional() {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    return null;
   }
   return new GoogleGenAI({
     apiKey,
@@ -2005,10 +2374,21 @@ function getGeminiClient() {
     }
   });
 }
+function getGeminiClient() {
+  const client = getGeminiClientOptional();
+  if (!client) {
+    throw new Error(
+      "GEMINI_API_KEY is not configured. Please add your API key in Settings > Secrets."
+    );
+  }
+  return client;
+}
 var chunkSynthesisCache = /* @__PURE__ */ new Map();
 var MAX_CHUNK_CACHE = 80;
 function makeChunkCacheKey(params) {
-  return crypto2.createHash("sha1").update(`${params.voiceName}|${params.styleInstruction}|${params.seed ?? ""}|${params.text}`).digest("hex");
+  return crypto2.createHash("sha1").update(
+    `${params.modelTier ?? ""}|${params.voiceId ?? ""}|${params.voiceName}|${params.language ?? ""}|${params.pitchRegister ?? ""}|${params.speed ?? 1}|${params.styleInstruction}|${params.seed ?? ""}|${params.text}`
+  ).digest("hex");
 }
 function saveChunkToCache(key, buffer, actualModel) {
   chunkSynthesisCache.set(key, { buffer, actualModel, createdAt: Date.now() });
@@ -2029,14 +2409,26 @@ var GEMINI_EXPRESSIVE_CHAIN = [
   "gemini-2.5-flash-preview-tts",
   "gemini-2.5-pro-preview-tts"
 ];
-function buildCandidateChain(preferredModel, modelTier) {
-  const baseList = modelTier === "expressive" ? [...GEMINI_EXPRESSIVE_CHAIN] : [...GEMINI_STANDARD_CHAIN];
-  const ordered = [preferredModel, ...baseList.filter((m) => m !== preferredModel)];
+var KEYLESS_CHAIN = ["keyless:neural-tts", "keyless:google-tts"];
+function buildCandidateChain(preferredModel, modelTier, hasGemini) {
+  if (modelTier === "keyless") {
+    return preferredModel === "keyless:google-tts" ? ["keyless:google-tts"] : [...KEYLESS_CHAIN];
+  }
+  const ordered = [];
+  if (hasGemini) {
+    const baseList = modelTier === "expressive" ? [...GEMINI_EXPRESSIVE_CHAIN] : [...GEMINI_STANDARD_CHAIN];
+    ordered.push(preferredModel, ...baseList.filter((m) => m !== preferredModel));
+  }
   if (process.env.OPENAI_API_KEY?.trim()) {
     ordered.push("openai:gpt-4o-mini-tts");
   }
   if (process.env.ELEVENLABS_API_KEY?.trim()) {
     ordered.push("elevenlabs:eleven_multilingual_v2");
+  }
+  for (const keylessModel of KEYLESS_CHAIN) {
+    if (!ordered.includes(keylessModel)) {
+      ordered.push(keylessModel);
+    }
   }
   return ordered;
 }
@@ -2178,7 +2570,7 @@ async function synthesizeSingleChunkAcrossProviders(params) {
       return { buffer: cached.buffer, actualModel: cached.actualModel };
     }
   }
-  const candidates = buildCandidateChain(params.preferredModel, params.modelTier);
+  const candidates = buildCandidateChain(params.preferredModel, params.modelTier, Boolean(params.ai));
   const attemptedModels = [];
   let sawQuota = false;
   let maxRetryAfter = 0;
@@ -2194,7 +2586,25 @@ async function synthesizeSingleChunkAcrossProviders(params) {
     attemptedModels.push(candidate);
     try {
       let buffer;
-      if (candidate === "openai:gpt-4o-mini-tts") {
+      if (candidate === "keyless:neural-tts") {
+        buffer = await synthesizeKeylessNeuralTts({
+          text: params.text,
+          voiceId: params.voiceId,
+          voiceName: params.voiceName,
+          language: params.language,
+          pitchRegister: params.pitchRegister,
+          speed: params.speed
+        });
+      } else if (candidate === "keyless:google-tts") {
+        buffer = await synthesizeKeylessGoogleTts({
+          text: params.text,
+          voiceId: params.voiceId,
+          voiceName: params.voiceName,
+          language: params.language,
+          pitchRegister: params.pitchRegister,
+          speed: params.speed
+        });
+      } else if (candidate === "openai:gpt-4o-mini-tts") {
         buffer = await callOpenAiTts({
           text: params.text,
           voiceName: params.voiceName,
@@ -2206,6 +2616,9 @@ async function synthesizeSingleChunkAcrossProviders(params) {
           voiceName: params.voiceName
         });
       } else {
+        if (!params.ai) {
+          continue;
+        }
         buffer = await callGeminiSingleTtsModel({
           ai: params.ai,
           model: candidate,
@@ -2234,7 +2647,7 @@ async function synthesizeSingleChunkAcrossProviders(params) {
       }
       lastNonQuotaError = err;
       const errStatus = err?.status;
-      if (i < candidates.length - 1 && (errStatus === 400 || errStatus === 502 || errStatus === 503)) {
+      if (i < candidates.length - 1 && (candidate.startsWith("keyless:") || errStatus === 400 || errStatus === 502 || errStatus === 503)) {
         continue;
       }
       throw err;
@@ -2306,7 +2719,7 @@ async function synthesizeSpeech(payload) {
   }
   const mode = payload.mode === "multi" ? "multi" : "single";
   const language = payload.language || "en";
-  const modelTier = payload.modelTier === "expressive" ? "expressive" : "standard";
+  const modelTier = payload.modelTier === "expressive" || payload.modelTier === "keyless" ? payload.modelTier : "standard";
   const speed = clampSpeed(typeof payload.speed === "number" ? payload.speed : 1);
   const pitchRegister = payload.pitchRegister || "balanced";
   const emotionIntensity = payload.emotionIntensity || "natural";
@@ -2329,7 +2742,7 @@ async function synthesizeSpeech(payload) {
     customVoiceDescription: payload.customVoiceDescription,
     dialogueLines: payload.dialogueLines
   });
-  const ai = getGeminiClient();
+  const ai = getGeminiClientOptional();
   const appliedPronunciations = /* @__PURE__ */ new Set();
   let rawMasterWav = null;
   let displayTextForCaptions = "";
@@ -2392,7 +2805,7 @@ async function synthesizeSpeech(payload) {
       });
       const nativeMultiModel = "gemini-3.8-flash-tts";
       let nativeSuccess = false;
-      if (!isModelOnCooldown(nativeMultiModel)) {
+      if (ai && modelTier !== "keyless" && !isModelOnCooldown(nativeMultiModel)) {
         try {
           const response = await ai.models.generateContent({
             model: nativeMultiModel,
@@ -2447,10 +2860,14 @@ async function synthesizeSpeech(payload) {
           });
           const resTurn = await synthesizeSingleChunkAcrossProviders({
             ai,
-            preferredModel: "gemini-3.8-flash-lite-tts",
-            modelTier: "standard",
+            preferredModel: modelTier === "keyless" ? "keyless:neural-tts" : "gemini-3.8-flash-lite-tts",
+            modelTier: modelTier === "keyless" ? "keyless" : "standard",
             text: pron.ttsText,
+            voiceId: speaker.voiceId,
             voiceName: speaker.baseVoice || "Puck",
+            language,
+            pitchRegister,
+            speed,
             styleInstruction: speakerStyle,
             seed: payload.seed,
             useChunkCache: true
@@ -2488,7 +2905,11 @@ async function synthesizeSpeech(payload) {
           preferredModel: actualModelUsed,
           modelTier,
           text: pron.ttsText,
+          voiceId: sp.voiceId,
           voiceName: sp.baseVoice || "Puck",
+          language,
+          pitchRegister,
+          speed,
           styleInstruction,
           seed: payload.seed,
           useChunkCache: true
@@ -2562,7 +2983,11 @@ async function synthesizeSpeech(payload) {
           preferredModel: actualModelUsed,
           modelTier,
           text: pron.ttsText,
+          voiceId,
           voiceName,
+          language,
+          pitchRegister,
+          speed,
           styleInstruction: segStyle,
           seed: payload.seed,
           useChunkCache: true
@@ -2675,7 +3100,11 @@ async function synthesizeSpeech(payload) {
           preferredModel: actualModelUsed,
           modelTier,
           text: singleText,
+          voiceId,
           voiceName,
+          language,
+          pitchRegister,
+          speed,
           styleInstruction: baseStyleInstruction,
           seed: payload.seed,
           useChunkCache: false
@@ -2703,7 +3132,11 @@ async function synthesizeSpeech(payload) {
             preferredModel: actualModelUsed,
             modelTier,
             text: chunkCleanText,
+            voiceId,
             voiceName,
+            language,
+            pitchRegister,
+            speed,
             styleInstruction: chunkStyle,
             seed: payload.seed,
             useChunkCache: true
@@ -2820,10 +3253,12 @@ async function synthesizeSpeech(payload) {
   }
   const audioUrl = `/api/clips/${saved.id}.${encoded.actualFormat}`;
   const downloadUrl = `/api/clips/${saved.id}.${encoded.actualFormat}?download=1`;
+  const wordSrtUrl = `/api/clips/${saved.id}/subtitles/srt?granularity=word&download=1`;
   return {
     clipId: saved.id,
     audioUrl,
     downloadUrl,
+    wordSrtUrl,
     audioBase64: encoded.buffer.toString("base64"),
     mimeType: encoded.mimeType,
     format: encoded.actualFormat,
@@ -2839,6 +3274,7 @@ async function synthesizeSpeech(payload) {
     timingSource,
     timingConfidence,
     ...payload.returnWordTimings === false ? {} : { wordTimings, phraseTimings },
+    ...payload.includeWordLevelSrt && wordTimings.length > 0 ? { wordSrt: generateWordLevelSrt(wordTimings) } : {},
     speechEnvelope: processed.speechEnvelope,
     ...payload.returnWaveformPeaks === false ? {} : { waveformPeaks: processed.waveformPeaks },
     segments: segmentsMeta,
@@ -2868,13 +3304,16 @@ async function regenerateClipSegment(params) {
     pronunciationPrompt: pron.pronunciationPrompt,
     emotionHint: getEmotionStyleHint(nextEmotion)
   });
-  const ai = getGeminiClient();
+  const ai = getGeminiClientOptional();
   const segResult = await synthesizeSingleChunkAcrossProviders({
     ai,
     preferredModel: existing.modelUsed || "gemini-3.8-flash-lite-tts",
-    modelTier: existing.modelUsed === "gemini-3.8-flash-tts" ? "expressive" : "standard",
+    modelTier: existing.modelUsed?.startsWith("keyless:") ? "keyless" : existing.modelUsed === "gemini-3.8-flash-tts" ? "expressive" : "standard",
     text: pron.ttsText,
+    voiceId: voicePreset.id,
     voiceName: voicePreset.baseVoice,
+    language: existing.language,
+    speed: params.speed ?? 1,
     styleInstruction,
     useChunkCache: true
   });
@@ -3018,28 +3457,34 @@ async function translateSpeechScript(text, targetLanguage, preserveDuration = fa
   if (!text || !text.trim()) {
     throw new InputValidationError("Enter text to translate or adapt.");
   }
-  const ai = getGeminiClient();
-  const targetDesc = targetLanguage === "hi" ? "natural, spoken Hindi in Devanagari script (\u0939\u093F\u0928\u094D\u0926\u0940)" : targetLanguage === "bilingual" ? "natural urban Hinglish (blending Hindi in Devanagari with conversational English phrases where natural)" : "natural, expressive English";
-  const durationRule = preserveDuration ? " Match the approximate spoken syllable count and sentence pacing of the source so the localized voiceover fits the same video duration." : "";
-  const response = await generateTextWithFallback({
-    ai,
-    primaryModel: "gemini-4-hydrogen",
-    fallbackModel: "gemini-2.5-flash",
-    contents: `Translate or adapt the following voiceover script into ${targetDesc}.${durationRule} Preserve any inline vocal tags like <breath>, <laugh>, <chuckle>, <sigh>, <gasp>, |yeah|, |mhm|, or [CURIOUS]/[AWE] exactly as written. Return ONLY the adapted script text with no commentary or quotes.
+  const ai = getGeminiClientOptional();
+  if (ai) {
+    const targetDesc = targetLanguage === "hi" ? "natural, spoken Hindi in Devanagari script (\u0939\u093F\u0928\u094D\u0926\u0940)" : targetLanguage === "bilingual" ? "natural urban Hinglish (blending Hindi in Devanagari with conversational English phrases where natural)" : "natural, expressive English";
+    const durationRule = preserveDuration ? " Match the approximate spoken syllable count and sentence pacing of the source so the localized voiceover fits the same video duration." : "";
+    try {
+      const response = await generateTextWithFallback({
+        ai,
+        primaryModel: "gemini-4-hydrogen",
+        fallbackModel: "gemini-2.5-flash",
+        contents: `Translate or adapt the following voiceover script into ${targetDesc}.${durationRule} Preserve any inline vocal tags like <breath>, <laugh>, <chuckle>, <sigh>, <gasp>, |yeah|, |mhm|, or [CURIOUS]/[AWE] exactly as written. Return ONLY the adapted script text with no commentary or quotes.
 
 Script:
 ${text.trim()}`,
-    config: {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        }
+      });
+      const translatedText = (response.text ?? "").trim();
+      if (translatedText) {
+        return translatedText;
+      }
+    } catch (err) {
+      if (!isQuotaOrRateError(err)) {
+        throw err;
+      }
     }
-  });
-  const translatedText = (response.text ?? "").trim();
-  if (!translatedText) {
-    const err = new Error("Translation returned empty output. Please try again.");
-    err.status = 502;
-    throw err;
   }
-  return translatedText;
+  return await translateScriptKeyless(text, targetLanguage);
 }
 async function localizeNarration(params) {
   if (!params.text?.trim()) {
@@ -3330,14 +3775,14 @@ async function replaceAudioSegmentFromBuffer(params) {
 }
 
 // src/mcp/createSvaraMcpServer.ts
-var SVARA_MCP_VERSION = "2.2.0";
-var SVARA_MCP_BUILD = "2026-11-16.2";
-var SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (\u0939\u093F\u0928\u094D\u0926\u0940), and Hinglish speech production server for video creators, reels, documentaries, and podcasts.
+var SVARA_MCP_VERSION = "2.3.0";
+var SVARA_MCP_BUILD = "2026-11-16.3";
+var SVARA_MCP_INSTRUCTIONS = `Svara Studio v${SVARA_MCP_VERSION} is a bilingual English, Hindi (\u0939\u093F\u0928\u094D\u0926\u0940), and Hinglish speech production server (MCP + OpenAPI/Plugin) for video creators, reels, documentaries, and podcasts.
 Recommended creator workflow:
 1. Discover voices via list_voices or inspect saved presets via list_voice_presets, and audition quickly with preview_voice.
 2. Register proper nouns or tricky words once with add_pronunciation so English and Hindi scripts speak them cleanly.
-3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordTimings, waveformPeaks, timingSource, timingConfidence, and speechEnvelope.
-4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized .srt, .vtt, or Rainbow Reels .ass karaoke captions via generate_subtitles without re-transcribing.
+3. Generate broadcast-ready audio with generate_speech (defaults to 48 kHz normalized mono WAV) or per-line emotion segments with generate_speech_segments. Automatic fallback routes seamlessly through Gemini -> OpenAI/ElevenLabs (if configured) -> zero-API-key unlimited Keyless TTS (modelTier: "keyless" also selects it directly). Each synthesis tool returns a native MCP audio attachment, file resource/resource_link, and structuredContent containing clipId, audioUrl, downloadUrl, wordSrtUrl, wordTimings (startMs/endMs), waveformPeaks, timingSource, timingConfidence, and speechEnvelope. Pass includeWordLevelSrt: true to also embed word-level .SRT inline.
+4. Retrieve previously generated clips anytime using get_clip({ clipId }), and generate synchronized phrase-level or word-level (granularity: "word" / wordLevel: true) .srt, .vtt, .ass (Rainbow Reels), or JSON captions via generate_subtitles without re-transcribing.
 5. Use localize_narration for simultaneous Hindi/Hinglish/English dubs, or pass existing files via audioFile/clipId to transcribe_audio, dub_audio, match_duration, analyze_voice, and replace_segment.`;
 function handleMcpToolError(error) {
   const mapped = mapApiError(error);
@@ -3363,6 +3808,7 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
   const base = publicBaseUrl.replace(/\/$/, "");
   const fullAudioUrl = `${base}${res.audioUrl}`;
   const fullDownloadUrl = `${base}${res.downloadUrl || `${res.audioUrl}?download=1`}`;
+  const fullWordSrtUrl = res.clipId ? `${base}${res.wordSrtUrl || `/api/clips/${res.clipId}/subtitles/srt?granularity=word&download=1`}` : void 0;
   const ext = res.format || "wav";
   const fileName = `svara-${res.clipId}.${ext}`;
   const resourceUri = `svara://clips/${fileName}`;
@@ -3379,12 +3825,14 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
       format: ext,
       sizeBytes: res.sizeBytes ?? 0,
       downloadUrl: fullDownloadUrl,
+      ...fullWordSrtUrl ? { wordSrtUrl: fullWordSrtUrl } : {},
       resourceUri,
       sampleRate: res.sampleRate ?? 48e3,
       channels: res.channels ?? 1
     },
     audioUrl: fullAudioUrl,
     downloadUrl: fullDownloadUrl,
+    ...fullWordSrtUrl ? { wordSrtUrl: fullWordSrtUrl } : {},
     mimeType: res.mimeType,
     format: ext,
     durationMs,
@@ -3401,6 +3849,7 @@ function buildAudioToolResult(publicBaseUrl, res, extraMeta = {}) {
     appliedPronunciations: res.appliedPronunciations ?? [],
     ...res.wordTimings ? { wordTimings: res.wordTimings } : {},
     ...res.phraseTimings ? { phraseTimings: res.phraseTimings } : {},
+    ...res.wordSrt ? { wordSrt: res.wordSrt } : {},
     ...res.waveformPeaks ? { waveformPeaks: res.waveformPeaks } : {},
     speechEnvelope: res.speechEnvelope ?? [],
     ...res.segments ? { segments: res.segments } : {},
@@ -3628,7 +4077,7 @@ function createSvaraMcpServer(publicBaseUrl) {
         voiceId: z.string().optional(),
         voicePresetId: z.string().optional().describe("Optional saved preset ID or name from list_voice_presets."),
         language: z.enum(["en", "hi", "bilingual"]).optional(),
-        modelTier: z.enum(["standard", "expressive"]).optional(),
+        modelTier: z.enum(["standard", "expressive", "keyless"]).optional().describe('Synthesis engine tier. "keyless" uses zero-API-key unlimited TTS directly; standard/expressive also auto-fallback to keyless when quotas are exhausted.'),
         stylePrompt: z.string().optional(),
         customVoiceDescription: z.string().optional(),
         speed: z.number().min(0.7).max(1.4).optional(),
@@ -3649,6 +4098,7 @@ function createSvaraMcpServer(publicBaseUrl) {
         fitMode: z.enum(["natural", "tight", "stretch"]).optional(),
         returnWordTimings: z.boolean().optional().default(true),
         returnWaveformPeaks: z.boolean().optional().default(true),
+        includeWordLevelSrt: z.boolean().optional().default(false).describe("When true, also returns a word-level .SRT string (wordSrt) in structuredContent."),
         projectId: z.string().optional()
       }
     },
@@ -3687,6 +4137,7 @@ function createSvaraMcpServer(publicBaseUrl) {
           fitMode: args.fitMode,
           returnWordTimings: args.returnWordTimings,
           returnWaveformPeaks: args.returnWaveformPeaks,
+          includeWordLevelSrt: args.includeWordLevelSrt,
           projectId: args.projectId
         });
         return buildAudioToolResult(publicBaseUrl, res);
@@ -3701,10 +4152,11 @@ function createSvaraMcpServer(publicBaseUrl) {
       title: "Retrieve Saved Clip Audio & Metadata",
       description: "Retrieve a previously generated Svara Studio clip by clipId, returning a fresh audio attachment, download URL, script, voiceUsed, modelUsed, durationMs, timingSource, timingConfidence, wordTimings, and waveformPeaks.",
       inputSchema: {
-        clipId: z.string().min(1)
+        clipId: z.string().min(1),
+        includeWordLevelSrt: z.boolean().optional().default(false)
       }
     },
-    async ({ clipId }) => {
+    async ({ clipId, includeWordLevelSrt }) => {
       try {
         const found = getClipAudioBuffer(clipId, false);
         if (!found) {
@@ -3714,12 +4166,14 @@ function createSvaraMcpServer(publicBaseUrl) {
         const base = publicBaseUrl.replace(/\/$/, "");
         const audioUrl = `${base}/api/clips/${rec.id}.${found.ext}`;
         const downloadUrl = `${audioUrl}?download=1`;
+        const wordSrtUrl = `${base}/api/clips/${rec.id}/subtitles/srt?granularity=word&download=1`;
         const fileName = `svara-${rec.id}.${found.ext}`;
         const base64 = found.buffer.toString("base64");
         const structuredPayload = {
           clipId: rec.id,
           audioUrl,
           downloadUrl,
+          wordSrtUrl,
           mimeType: found.mimeType,
           format: found.ext,
           sizeBytes: found.buffer.length,
@@ -3735,6 +4189,7 @@ function createSvaraMcpServer(publicBaseUrl) {
           timingConfidence: rec.timingConfidence ?? 0.85,
           wordTimings: rec.wordTimings,
           phraseTimings: rec.phraseTimings,
+          ...includeWordLevelSrt && rec.wordTimings?.length ? { wordSrt: generateWordLevelSrt(rec.wordTimings) } : {},
           waveformPeaks: rec.waveformPeaks ?? [],
           speechEnvelope: rec.speechEnvelope,
           segments: rec.segments,
@@ -3836,11 +4291,13 @@ function createSvaraMcpServer(publicBaseUrl) {
   server.registerTool(
     "generate_subtitles",
     {
-      title: "Generate Synchronized Subtitles (.SRT, .VTT, .ASS, JSON)",
-      description: "Generate time-aligned captions from a synthesized clipId based on duration and line constraints. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).",
+      title: "Generate Synchronized Subtitles (Phrase & Word-Level .SRT, .VTT, .ASS, JSON)",
+      description: 'Generate time-aligned phrase or word-level captions from a synthesized clipId based on duration and line constraints. Set granularity: "word" (or wordLevel: true) with format: "srt" for word-by-word .SRT files. Includes Rainbow Reels Captions preset (white text + cyan #00E5FF active-word karaoke highlighting, max 3 lines, vertical 1080x1920 safe positioning).',
       inputSchema: {
         clipId: z.string(),
         format: z.enum(["srt", "vtt", "ass", "json"]).default("ass"),
+        granularity: z.enum(["phrase", "word"]).optional().default("phrase").describe('Use "word" to emit one cue per spoken word (word-level SRT/VTT/ASS/JSON).'),
+        wordLevel: z.boolean().optional().default(false).describe('Alias for granularity: "word".'),
         preset: z.enum(["rainbow_reels", "clean_editorial"]).default("rainbow_reels"),
         maxLines: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional().default(3),
         maxCharsPerLine: z.number().int().min(10).max(80).optional(),
@@ -3852,6 +4309,8 @@ function createSvaraMcpServer(publicBaseUrl) {
     async ({
       clipId,
       format,
+      granularity,
+      wordLevel,
       preset,
       maxLines,
       maxCharsPerLine,
@@ -3864,9 +4323,12 @@ function createSvaraMcpServer(publicBaseUrl) {
         if (!record) {
           throw new Error(`Clip '${clipId}' not found.`);
         }
+        const effectiveGranularity = wordLevel || granularity === "word" ? "word" : "phrase";
         const subtitleText = generateSubtitles({
           wordTimings: record.wordTimings,
           format,
+          granularity: effectiveGranularity,
+          wordLevel: effectiveGranularity === "word",
           preset,
           maxLines,
           maxCharsPerLine,
@@ -3874,7 +4336,7 @@ function createSvaraMcpServer(publicBaseUrl) {
           maxDurationSeconds,
           safeAreaMarginV
         });
-        const downloadUrl = `${publicBaseUrl.replace(/\/$/, "")}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&download=1`;
+        const downloadUrl = `${publicBaseUrl.replace(/\/$/, "")}/api/clips/${clipId}/subtitles/${format}?preset=${preset}&maxLines=${maxLines}&granularity=${effectiveGranularity}&download=1`;
         const mimeMap = {
           srt: "application/x-subrip",
           vtt: "text/vtt",
@@ -3886,26 +4348,27 @@ function createSvaraMcpServer(publicBaseUrl) {
             {
               type: "resource_link",
               uri: downloadUrl,
-              name: `svara-${clipId}.${format}`,
-              title: `Subtitles (${preset}, ${format.toUpperCase()})`,
+              name: `svara-${clipId}${effectiveGranularity === "word" ? "-words" : ""}.${format}`,
+              title: `Subtitles (${effectiveGranularity}, ${preset}, ${format.toUpperCase()})`,
               mimeType: mimeMap[format]
             },
             {
               type: "resource",
               resource: {
-                uri: `svara://clips/${clipId}.${format}`,
+                uri: `svara://clips/${clipId}-${effectiveGranularity}.${format}`,
                 mimeType: mimeMap[format],
                 text: subtitleText
               }
             },
             {
               type: "text",
-              text: `Generated ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`
+              text: `Generated ${effectiveGranularity}-level ${format.toUpperCase()} subtitles (${preset}, max ${maxLines} lines) for clip ${clipId}. Download: ${downloadUrl}`
             }
           ],
           structuredContent: {
             clipId,
             format,
+            granularity: effectiveGranularity,
             preset,
             maxLines,
             timingSource: record.timingSource || "forced_alignment",
@@ -4345,6 +4808,7 @@ function createSvaraMcpServer(publicBaseUrl) {
           audioUrl: `${base}${c.audioUrl}`,
           downloadUrl: `${base}${c.downloadUrl}`,
           srtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?download=1`,
+          wordSrtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?granularity=word&download=1`,
           assUrl: `${base}/api/clips/${c.clipId}/subtitles/ass?preset=rainbow_reels&download=1`
         }))
       };
@@ -4517,9 +4981,798 @@ function createSvaraMcpServer(publicBaseUrl) {
   return server;
 }
 
+// src/server/openApiSpec.ts
+function buildAiPluginManifest(baseUrl) {
+  const origin = baseUrl.replace(/\/$/, "");
+  return {
+    schema_version: "v1",
+    name_for_human: "Svara Studio",
+    name_for_model: "svara_studio",
+    description_for_human: "Bilingual English, Hindi & Hinglish AI Speech Studio with 48 kHz WAV mastering, forced-aligned word timings, and word-level .SRT / .VTT / .ASS subtitles.",
+    description_for_model: "Synthesize English, Hindi (\u0939\u093F\u0928\u094D\u0926\u0940), and Hinglish single-voice or multi-speaker dialogue speech as 48 kHz WAV/MP3/M4A/FLAC files, retrieve forced-aligned wordTimings (startMs, endMs), generate phrase or word-level .SRT/.VTT/.ASS subtitles, manage custom pronunciation guides and voice presets, localize scripts, transcribe/dub/time-stretch/replace audio segments, and organize narration projects.",
+    auth: {
+      type: "none"
+    },
+    api: {
+      type: "openapi",
+      url: `${origin}/openapi.json`,
+      is_user_authenticated: false
+    },
+    logo_url: `${origin}/favicon.ico`,
+    contact_email: "support@svarastudio.local",
+    legal_info_url: `${origin}/`
+  };
+}
+function buildOpenApiSpec(baseUrl) {
+  const origin = baseUrl.replace(/\/$/, "");
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: "Svara Studio Speech & Subtitle Production API",
+      version: SVARA_MCP_VERSION,
+      description: "Full REST / ChatGPT Plugin / Custom Actions API exposing all Svara Studio TTS, multi-speaker dialogue, word-level timing offsets (startMs/endMs), word-level .SRT/.VTT/.ASS caption generation, localization, pronunciation dictionary, voice presets, and audio editing tools."
+    },
+    servers: [{ url: origin, description: "Svara Studio Server" }],
+    paths: {
+      "/api/voices": {
+        get: {
+          operationId: "listVoices",
+          summary: "List English, Hindi, and bilingual voice personas",
+          parameters: [
+            { name: "language", in: "query", schema: { type: "string", enum: ["All", "English", "Hindi", "Bilingual"] } },
+            { name: "category", in: "query", schema: { type: "string" } },
+            { name: "query", in: "query", schema: { type: "string" } }
+          ],
+          responses: {
+            "200": { description: "Filtered voice persona catalog" }
+          }
+        }
+      },
+      "/api/tts/generate": {
+        post: {
+          operationId: "generateSpeech",
+          summary: "Generate English, Hindi, or multi-speaker speech with wordTimings (startMs, endMs) and optional word-level SRT",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    mode: { type: "string", enum: ["single", "multi"], default: "single" },
+                    language: { type: "string", enum: ["en", "hi", "bilingual"], default: "en" },
+                    modelTier: { type: "string", enum: ["standard", "expressive", "keyless"], default: "standard" },
+                    text: { type: "string" },
+                    voiceId: { type: "string" },
+                    voiceName: { type: "string", enum: ["Kore", "Puck", "Charon", "Fenrir", "Zephyr"] },
+                    stylePrompt: { type: "string" },
+                    customVoiceDescription: { type: "string" },
+                    speed: { type: "number", minimum: 0.7, maximum: 1.4, default: 1 },
+                    pitchRegister: { type: "string", enum: ["deep", "balanced", "bright"] },
+                    emotionIntensity: { type: "string", enum: ["subtle", "natural", "dramatic"] },
+                    format: { type: "string", enum: ["wav", "mp3", "m4a", "flac"], default: "wav" },
+                    sampleRate: { type: "integer", enum: [24e3, 44100, 48e3], default: 48e3 },
+                    channels: { type: "integer", enum: [1, 2], default: 1 },
+                    normalize: { type: "boolean", default: true },
+                    trimSilence: { type: "boolean", default: true },
+                    masteringPreset: {
+                      type: "string",
+                      enum: ["none", "youtube_narration", "instagram_reel", "podcast", "audiobook"]
+                    },
+                    targetDurationSeconds: { type: "number" },
+                    segmentMode: { type: "boolean" },
+                    includeWordLevelSrt: {
+                      type: "boolean",
+                      default: false,
+                      description: "When true, includes inline word-level .SRT in response.wordSrt."
+                    },
+                    dialogueLines: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          speakerKey: { type: "string" },
+                          text: { type: "string" },
+                          emotion: { type: "string" }
+                        }
+                      }
+                    },
+                    projectId: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Synthesized audio clip with clipId, audioUrl, downloadUrl, wordSrtUrl, wordTimings (startMs/endMs), and waveformPeaks."
+            }
+          }
+        }
+      },
+      "/api/tts/segments/regenerate": {
+        post: {
+          operationId: "regenerateSegment",
+          summary: "Regenerate a single sentence segment in an existing clip and re-stitch master WAV",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["clipId", "segmentIndex"],
+                  properties: {
+                    clipId: { type: "string" },
+                    segmentIndex: { type: "integer", minimum: 0 },
+                    text: { type: "string" },
+                    emotion: { type: "string" },
+                    voiceId: { type: "string" },
+                    stylePrompt: { type: "string" },
+                    speed: { type: "number" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Updated clip with regenerated segment" } }
+        }
+      },
+      "/api/clips": {
+        get: {
+          operationId: "listClips",
+          summary: "List recently generated audio clips",
+          responses: { "200": { description: "Recent clip metadata list" } }
+        }
+      },
+      "/api/clips/{id}": {
+        get: {
+          operationId: "getClip",
+          summary: "Retrieve clip audio URLs, wordTimings (startMs/endMs), wordSrtUrl, and waveformPeaks",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Saved clip metadata and timing offsets" } }
+        }
+      },
+      "/api/clips/{id}/subtitles/{format}": {
+        get: {
+          operationId: "getClipSubtitles",
+          summary: "Download phrase-level or word-level .SRT, .VTT, .ASS, or JSON subtitles for a clip",
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "string" } },
+            { name: "format", in: "path", required: true, schema: { type: "string", enum: ["srt", "vtt", "ass", "json"] } },
+            { name: "granularity", in: "query", schema: { type: "string", enum: ["phrase", "word"], default: "phrase" } },
+            { name: "wordLevel", in: "query", schema: { type: "boolean" } },
+            { name: "preset", in: "query", schema: { type: "string", enum: ["rainbow_reels", "clean_editorial"] } },
+            { name: "maxLines", in: "query", schema: { type: "integer", enum: [1, 2, 3] } },
+            { name: "maxCharsPerLine", in: "query", schema: { type: "integer" } },
+            { name: "maxDurationSeconds", in: "query", schema: { type: "number" } },
+            { name: "download", in: "query", schema: { type: "boolean" } }
+          ],
+          responses: { "200": { description: "Formatted subtitle file content" } }
+        }
+      },
+      "/api/subtitles": {
+        post: {
+          operationId: "generateSubtitles",
+          summary: "Generate phrase-level or word-level .SRT, .VTT, .ASS, or JSON subtitles from clipId or wordTimings",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    clipId: { type: "string" },
+                    wordTimings: { type: "array", items: { type: "object" } },
+                    format: { type: "string", enum: ["srt", "vtt", "ass", "json"], default: "srt" },
+                    granularity: { type: "string", enum: ["phrase", "word"], default: "phrase" },
+                    wordLevel: { type: "boolean", default: false },
+                    preset: { type: "string", enum: ["rainbow_reels", "clean_editorial"], default: "rainbow_reels" },
+                    maxLines: { type: "integer", enum: [1, 2, 3] },
+                    maxCharsPerLine: { type: "integer" },
+                    maxPhraseDurationMs: { type: "integer" },
+                    maxDurationSeconds: { type: "number" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Generated subtitle content" } }
+        }
+      },
+      "/api/script/translate": {
+        post: {
+          operationId: "translateScript",
+          summary: "Translate or adapt a TTS script between English, Hindi, and Hinglish while keeping performance tags",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["text"],
+                  properties: {
+                    text: { type: "string" },
+                    targetLanguage: { type: "string", enum: ["en", "hi", "bilingual"], default: "hi" },
+                    preserveDuration: { type: "boolean", default: false }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Translated script" } }
+        }
+      },
+      "/api/script/localize": {
+        post: {
+          operationId: "localizeNarration",
+          summary: "Localize narration into Hindi/Hinglish/English audio clips with synchronized word timings and SRTs",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["text", "targetLanguages"],
+                  properties: {
+                    text: { type: "string" },
+                    targetLanguages: { type: "array", items: { type: "string", enum: ["en", "hi", "bilingual"] } },
+                    voiceId: { type: "string" },
+                    preserveDuration: { type: "boolean", default: true },
+                    targetDurationSeconds: { type: "number" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Localized audio clips and SRT files" } }
+        }
+      },
+      "/api/audio/transcribe": {
+        post: {
+          operationId: "transcribeAudio",
+          summary: "Transcribe a clipId, audioUrl, or base64 audio into English/Hindi text",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    clipId: { type: "string" },
+                    audioUrl: { type: "string" },
+                    audioBase64: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Transcript text" } }
+        }
+      },
+      "/api/audio/analyze-voice": {
+        post: {
+          operationId: "analyzeVoice",
+          summary: "Analyze timbre, cadence, and WPM from an audio sample and recommend a matching Svara voice",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    clipId: { type: "string" },
+                    audioUrl: { type: "string" },
+                    audioBase64: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Voice analysis and recommended voiceId" } }
+        }
+      },
+      "/api/audio/match-duration": {
+        post: {
+          operationId: "matchAudioDuration",
+          summary: "Time-stretch a clip or audio input to exact targetDurationSeconds without pitch distortion",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["targetDurationSeconds"],
+                  properties: {
+                    clipId: { type: "string" },
+                    audioUrl: { type: "string" },
+                    audioBase64: { type: "string" },
+                    targetDurationSeconds: { type: "number" },
+                    sampleRate: { type: "integer", enum: [24e3, 44100, 48e3] },
+                    channels: { type: "integer", enum: [1, 2] }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Duration-matched audio clip" } }
+        }
+      },
+      "/api/audio/replace-segment": {
+        post: {
+          operationId: "replaceAudioSegment",
+          summary: "Replace a [startMs..endMs] span in an audio clip with newly synthesized replacementText",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["startMs", "endMs", "replacementText"],
+                  properties: {
+                    clipId: { type: "string" },
+                    audioUrl: { type: "string" },
+                    audioBase64: { type: "string" },
+                    startMs: { type: "integer" },
+                    endMs: { type: "integer" },
+                    replacementText: { type: "string" },
+                    voiceId: { type: "string" },
+                    language: { type: "string", enum: ["en", "hi", "bilingual"] }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Updated audio clip with spliced replacement" } }
+        }
+      },
+      "/api/pronunciations": {
+        get: {
+          operationId: "listPronunciations",
+          summary: "List custom English and Hindi phonetic/IPA pronunciation rules",
+          responses: { "200": { description: "Pronunciation dictionary entries" } }
+        },
+        post: {
+          operationId: "upsertPronunciation",
+          summary: "Add or update a custom phonetic/IPA pronunciation rule",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["term", "phonetic"],
+                  properties: {
+                    id: { type: "string" },
+                    term: { type: "string" },
+                    phonetic: { type: "string" },
+                    ipa: { type: "string" },
+                    language: { type: "string", enum: ["en", "hi", "bilingual"] },
+                    notes: { type: "string" },
+                    enabled: { type: "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Saved pronunciation entry" } }
+        }
+      },
+      "/api/pronunciations/{id}": {
+        delete: {
+          operationId: "deletePronunciation",
+          summary: "Delete a pronunciation rule by ID or term",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Deletion confirmation" } }
+        }
+      },
+      "/api/presets": {
+        get: {
+          operationId: "listVoicePresets",
+          summary: "List saved reusable voice & mastering presets",
+          responses: { "200": { description: "Voice presets list" } }
+        },
+        post: {
+          operationId: "upsertVoicePreset",
+          summary: "Create or update a reusable voice & mastering preset",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["name", "voiceId"],
+                  properties: {
+                    name: { type: "string" },
+                    voiceId: { type: "string" },
+                    language: { type: "string", enum: ["en", "hi", "bilingual"] },
+                    stylePrompt: { type: "string" },
+                    speed: { type: "number" },
+                    masteringPreset: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Saved preset" } }
+        }
+      },
+      "/api/presets/{id}": {
+        delete: {
+          operationId: "deleteVoicePreset",
+          summary: "Delete a saved voice preset by ID",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Deletion confirmation" } }
+        }
+      },
+      "/api/projects": {
+        get: {
+          operationId: "listProjects",
+          summary: "List saved narration projects",
+          responses: { "200": { description: "Projects list" } }
+        },
+        post: {
+          operationId: "createProject",
+          summary: "Create a named multi-clip narration project",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["name"],
+                  properties: {
+                    name: { type: "string" },
+                    description: { type: "string" },
+                    defaultVoicePresetId: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Created project" } }
+        }
+      },
+      "/api/projects/{id}": {
+        get: {
+          operationId: "getProject",
+          summary: "Inspect a project and its ordered clips",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Project details" } }
+        }
+      },
+      "/api/projects/{id}/clips": {
+        post: {
+          operationId: "addClipToProject",
+          summary: "Attach an existing clipId to a narration project",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["clipId"],
+                  properties: {
+                    clipId: { type: "string" },
+                    title: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Updated project" } }
+        }
+      },
+      "/api/projects/{id}/clips/{clipId}": {
+        patch: {
+          operationId: "updateProjectClip",
+          summary: "Update title, text, or order of a clip inside a project",
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "string" } },
+            { name: "clipId", in: "path", required: true, schema: { type: "string" } }
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    title: { type: "string" },
+                    text: { type: "string" },
+                    order: { type: "integer" }
+                  }
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Updated project" } }
+        },
+        delete: {
+          operationId: "deleteProjectClip",
+          summary: "Remove a clip from a project",
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "string" } },
+            { name: "clipId", in: "path", required: true, schema: { type: "string" } }
+          ],
+          responses: { "200": { description: "Updated project" } }
+        }
+      },
+      "/api/projects/{id}/export": {
+        get: {
+          operationId: "exportProject",
+          summary: "Export project manifest with audio download URLs, phrase SRT, word-level SRT, and Rainbow Reels ASS URLs",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Exported project manifest" } }
+        }
+      }
+    }
+  };
+}
+
+// src/server/voiceAnalysis.ts
+import { execFile as execFile3 } from "node:child_process";
+import fs4 from "node:fs/promises";
+import os3 from "node:os";
+import path4 from "node:path";
+import { promisify as promisify3 } from "node:util";
+var execFileAsync3 = promisify3(execFile3);
+function inferExtFromMime(mimeType = "") {
+  const lower = mimeType.toLowerCase();
+  if (lower.includes("webm")) return ".webm";
+  if (lower.includes("ogg")) return ".ogg";
+  if (lower.includes("mpeg") || lower.includes("mp3")) return ".mp3";
+  if (lower.includes("mp4") || lower.includes("m4a") || lower.includes("aac")) return ".m4a";
+  if (lower.includes("flac")) return ".flac";
+  return ".wav";
+}
+async function decodeAudioBufferToMono24kPcm(buffer, mimeType = "audio/wav") {
+  const isRiffWav = buffer.length >= 44 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WAVE";
+  if (isRiffWav) {
+    const parsed = parseWavBuffer(buffer);
+    const mono = toMonoPcm(parsed.pcm, parsed.channels);
+    if (parsed.sampleRate === 24e3) {
+      return { pcm: mono, durationMs: parsed.durationMs, sampleRate: 24e3 };
+    }
+  }
+  const tmpDir = await fs4.mkdtemp(path4.join(os3.tmpdir(), "svara-clone-"));
+  const inPath = path4.join(tmpDir, `sample${inferExtFromMime(mimeType)}`);
+  const outPath = path4.join(tmpDir, "decoded.wav");
+  try {
+    await fs4.writeFile(inPath, buffer);
+    await execFileAsync3(
+      "ffmpeg",
+      ["-y", "-i", inPath, "-ar", "24000", "-ac", "1", "-f", "wav", outPath],
+      { timeout: 25e3 }
+    );
+    const wavBuf = await fs4.readFile(outPath);
+    const parsed = parseWavBuffer(wavBuf);
+    return {
+      pcm: parsed.pcm,
+      durationMs: Math.max(500, parsed.durationMs),
+      sampleRate: 24e3
+    };
+  } finally {
+    await fs4.rm(tmpDir, { recursive: true, force: true }).catch(() => {
+    });
+  }
+}
+function extractAcousticProfileFromPcm(pcm, sampleRate = 24e3, durationMsHint) {
+  const durationMs = typeof durationMsHint === "number" && durationMsHint > 0 ? Math.round(durationMsHint) : Math.max(500, Math.round(pcm.length / Math.max(1, sampleRate) * 1e3));
+  if (pcm.length < Math.floor(sampleRate * 0.1)) {
+    return {
+      pitchHz: 152,
+      pitchRegister: "balanced",
+      speakingWpm: 142,
+      warmth: 68,
+      brightness: 55,
+      energy: 62,
+      durationMs
+    };
+  }
+  const frameLen = Math.max(256, Math.round(sampleRate * 0.03));
+  const frameEnergies = [];
+  let totalSq = 0;
+  let zeroCrossings = 0;
+  for (let i = 0; i < pcm.length; i += 1) {
+    const norm = pcm[i] / 32768;
+    totalSq += norm * norm;
+    if (i > 0) {
+      const prev = pcm[i - 1];
+      if (prev >= 0 && pcm[i] < 0 || prev < 0 && pcm[i] >= 0) {
+        zeroCrossings += 1;
+      }
+    }
+  }
+  for (let start = 0; start + frameLen <= pcm.length; start += frameLen) {
+    let fSq = 0;
+    for (let j = 0; j < frameLen; j += 1) {
+      const n = pcm[start + j] / 32768;
+      fSq += n * n;
+    }
+    frameEnergies.push(Math.sqrt(fSq / frameLen));
+  }
+  const globalRms = Math.sqrt(totalSq / Math.max(1, pcm.length));
+  const zcrRate = zeroCrossings / Math.max(1, pcm.length);
+  const acFrame = Math.min(1024, Math.floor(sampleRate * 0.04));
+  const minLag = Math.max(16, Math.floor(sampleRate / 320));
+  const maxLag = Math.min(acFrame - 2, Math.floor(sampleRate / 75));
+  const pitchCandidates = [];
+  const activeThreshold = Math.max(0.015, globalRms * 0.55);
+  for (let start = 0; start + acFrame <= pcm.length; start += acFrame) {
+    let sq = 0;
+    for (let j = 0; j < acFrame; j += 1) {
+      const n = pcm[start + j] / 32768;
+      sq += n * n;
+    }
+    const rms = Math.sqrt(sq / acFrame);
+    if (rms < activeThreshold) continue;
+    let bestLag = -1;
+    let bestCorr = 0;
+    for (let lag = minLag; lag <= maxLag; lag += 1) {
+      let num = 0;
+      let denA = 0;
+      let denB = 0;
+      const limit = acFrame - lag;
+      for (let i = 0; i < limit; i += 2) {
+        const a = pcm[start + i] / 32768;
+        const b = pcm[start + i + lag] / 32768;
+        num += a * b;
+        denA += a * a;
+        denB += b * b;
+      }
+      const den = Math.sqrt(denA * denB);
+      const corr = den > 0 ? num / den : 0;
+      if (corr > bestCorr) {
+        bestCorr = corr;
+        bestLag = lag;
+      }
+    }
+    if (bestLag > 0 && bestCorr >= 0.4) {
+      pitchCandidates.push(sampleRate / bestLag);
+    }
+  }
+  let pitchHz = 152;
+  if (pitchCandidates.length > 0) {
+    pitchCandidates.sort((a, b) => a - b);
+    pitchHz = Math.round(pitchCandidates[Math.floor(pitchCandidates.length / 2)]);
+  }
+  const peakEnv = Math.max(0.05, ...frameEnergies);
+  const syllThresh = peakEnv * 0.28;
+  let pulses = 0;
+  let inPulse = false;
+  let activeFrames = 0;
+  for (const e of frameEnergies) {
+    if (e >= activeThreshold * 0.7) activeFrames += 1;
+    if (!inPulse && e >= syllThresh) {
+      inPulse = true;
+      pulses += 1;
+    } else if (inPulse && e < syllThresh * 0.55) {
+      inPulse = false;
+    }
+  }
+  const activeSec = Math.max(0.8, activeFrames * frameLen / sampleRate);
+  const pulsesPerMin = pulses / activeSec * 60;
+  const speakingWpm = Math.max(
+    112,
+    Math.min(176, Math.round(pulses > 2 ? Math.max(115, Math.min(175, pulsesPerMin * 0.72)) : 142))
+  );
+  const energy = Math.max(28, Math.min(95, Math.round(globalRms * 460)));
+  const brightness = Math.max(25, Math.min(92, Math.round(zcrRate * 540)));
+  const warmth = Math.max(32, Math.min(94, Math.round(102 - brightness * 0.45)));
+  const pitchRegister = pitchHz < 142 ? "deep" : pitchHz > 192 ? "bright" : "balanced";
+  return {
+    pitchHz,
+    pitchRegister,
+    speakingWpm,
+    warmth,
+    brightness,
+    energy,
+    durationMs
+  };
+}
+function buildClonePresetFromMetrics(params) {
+  const { metrics, language } = params;
+  const preferredGender = metrics.pitchHz >= 175 ? "Female" : "Male";
+  const langLabel = language === "hi" ? "Hindi" : language === "bilingual" ? "Bilingual" : "English";
+  const matchedVoice = VOICE_PRESETS.find(
+    (v) => v.gender === preferredGender && (v.language === langLabel || v.language === "Bilingual")
+  ) ?? VOICE_PRESETS.find((v) => v.gender === preferredGender) ?? VOICE_PRESETS[0];
+  const cleanName = params.presetName.trim() || "My Studio Voice";
+  const finalName = /^clone\b/i.test(cleanName) ? cleanName : `Clone \u2014 ${cleanName}`;
+  const registerLabel = metrics.pitchRegister === "deep" ? "Deep grounded" : metrics.pitchRegister === "bright" ? "Bright articulate" : "Balanced warm";
+  const timbreSummary = `${registerLabel} vocal timbre (~${metrics.pitchHz} Hz, ${metrics.speakingWpm} WPM)`;
+  const customVoiceDescription = params.aiDescriptionHint?.trim() || `Cloned voice model: ${timbreSummary}. Modeled from a ${(metrics.durationMs / 1e3).toFixed(1)}s vocal capture with ${metrics.warmth >= 70 ? "warm resonant body" : "crisp studio presence"}.`;
+  const stylePrompt = params.aiStyleHint?.trim() || `Natural personal clone delivery matching ${timbreSummary}`;
+  const speed = Number(Math.max(0.85, Math.min(1.22, metrics.speakingWpm / 142)).toFixed(2));
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  return {
+    id: `clone-${Date.now().toString(36)}`,
+    name: finalName,
+    voiceId: matchedVoice.id,
+    language,
+    stylePrompt,
+    customVoiceDescription,
+    speed,
+    pitchRegister: metrics.pitchRegister,
+    emotionIntensity: metrics.energy > 72 ? "natural" : "subtle",
+    expressiveControls: {
+      warmth: metrics.warmth,
+      energy: metrics.energy,
+      authority: metrics.pitchRegister === "deep" ? 78 : 62,
+      pauseStrength: 58
+    },
+    masteringPreset: "podcast",
+    sampleRate: 48e3,
+    channels: 1,
+    createdAt: now,
+    isClone: true,
+    clonedAt: now,
+    sampleDurationMs: metrics.durationMs,
+    cloneAcousticProfile: {
+      pitchHz: metrics.pitchHz,
+      pitchRegister: metrics.pitchRegister,
+      speakingWpm: metrics.speakingWpm,
+      warmth: metrics.warmth,
+      brightness: metrics.brightness,
+      energy: metrics.energy,
+      timbreSummary,
+      matchedBaseVoiceName: matchedVoice.baseVoice,
+      source: params.source || "dsp"
+    }
+  };
+}
+async function createClonedVoicePreset(params) {
+  const mimeType = params.mimeType || "audio/wav";
+  const { pcm, durationMs, sampleRate } = await decodeAudioBufferToMono24kPcm(
+    params.buffer,
+    mimeType
+  );
+  const metrics = extractAcousticProfileFromPcm(pcm, sampleRate, durationMs);
+  let aiDescriptionHint;
+  let aiStyleHint;
+  let transcript = "";
+  let source = "dsp";
+  if (params.optionalAiAnalyze && process.env.GEMINI_API_KEY?.trim()) {
+    try {
+      const aiRes = await Promise.race([
+        params.optionalAiAnalyze(params.buffer, mimeType),
+        new Promise((resolve) => setTimeout(() => resolve(null), 2500))
+      ]);
+      if (aiRes) {
+        if (aiRes.voiceDescription) {
+          aiDescriptionHint = aiRes.voiceDescription;
+          source = "gemini+dsp";
+        }
+        if (aiRes.recommendedStylePrompt) {
+          aiStyleHint = aiRes.recommendedStylePrompt;
+        }
+        if (aiRes.transcript) {
+          transcript = aiRes.transcript;
+        }
+      }
+    } catch {
+    }
+  }
+  const candidate = buildClonePresetFromMetrics({
+    presetName: params.presetName,
+    language: params.language || "en",
+    metrics,
+    aiDescriptionHint,
+    aiStyleHint,
+    source
+  });
+  const preset = upsertVoicePreset(candidate);
+  return {
+    preset,
+    presets: listVoicePresets(),
+    transcript
+  };
+}
+
 // server.ts
 var __filename = fileURLToPath(import.meta.url);
-var __dirname = path3.dirname(__filename);
+var __dirname = path5.dirname(__filename);
 var PORT = Number(process.env.PORT || 3e3);
 function resolvePublicBaseUrl(req) {
   if (process.env.APP_URL && process.env.APP_URL !== "MY_APP_URL") {
@@ -4561,11 +5814,31 @@ async function startServer() {
       providers: {
         gemini: Boolean(process.env.GEMINI_API_KEY),
         openai: Boolean(process.env.OPENAI_API_KEY?.trim()),
-        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY?.trim())
+        elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY?.trim()),
+        keyless: true
       },
       mcpEndpoint: `${base}/mcp`,
-      sseEndpoint: `${base}/sse`
+      sseEndpoint: `${base}/sse`,
+      openApiSpec: `${base}/openapi.json`,
+      aiPluginManifest: `${base}/.well-known/ai-plugin.json`
     });
+  });
+  app.get("/.well-known/ai-plugin.json", mcpCorsMiddleware, (req, res) => {
+    res.json(buildAiPluginManifest(resolvePublicBaseUrl(req)));
+  });
+  app.get("/openapi.json", mcpCorsMiddleware, (req, res) => {
+    res.json(buildOpenApiSpec(resolvePublicBaseUrl(req)));
+  });
+  app.get("/api/voices", mcpCorsMiddleware, (req, res) => {
+    const rawLang = String(req.query.language || "All");
+    const language = ["All", "English", "Hindi", "Bilingual"].includes(rawLang) ? rawLang : "All";
+    const rawCat = String(req.query.category || "All");
+    const category = ["All", "Narration", "Conversational", "Characters", "News & Anchor", "Wellness"].includes(
+      rawCat
+    ) ? rawCat : "All";
+    const query = String(req.query.query || "");
+    const voices = filterVoices(VOICE_PRESETS, query, language, category);
+    res.json({ count: voices.length, voices });
   });
   app.get("/api/clips/:id.:ext", mcpCorsMiddleware, (req, res) => {
     const id = String(req.params.id);
@@ -4600,11 +5873,19 @@ async function startServer() {
     const preset = String(req.query.preset || "rainbow_reels");
     const maxLinesNum = Number(req.query.maxLines || 3);
     const maxLines = maxLinesNum === 1 || maxLinesNum === 2 ? maxLinesNum : 3;
+    const maxCharsPerLine = req.query.maxCharsPerLine ? Number(req.query.maxCharsPerLine) : void 0;
+    const maxDurationSeconds = req.query.maxDurationSeconds ? Number(req.query.maxDurationSeconds) : void 0;
+    const isWordLevel = req.query.granularity === "word" || req.query.wordLevel === "1" || req.query.wordLevel === "true";
+    const granularity = isWordLevel ? "word" : "phrase";
     const text = generateSubtitles({
       wordTimings: record.wordTimings,
       format,
+      granularity,
+      wordLevel: isWordLevel,
       preset,
-      maxLines
+      maxLines,
+      maxCharsPerLine: Number.isFinite(maxCharsPerLine) ? maxCharsPerLine : void 0,
+      maxDurationSeconds: Number.isFinite(maxDurationSeconds) ? maxDurationSeconds : void 0
     });
     const mimeMap = {
       srt: "application/x-subrip; charset=utf-8",
@@ -4616,26 +5897,30 @@ async function startServer() {
     res.setHeader("Content-Type", mimeMap[format]);
     res.setHeader(
       "Content-Disposition",
-      `${isDownload ? "attachment" : "inline"}; filename="svara-${id}.${format}"`
+      `${isDownload ? "attachment" : "inline"}; filename="svara-${id}${isWordLevel ? "-words" : ""}.${format}"`
     );
     res.send(text);
   });
-  app.post("/api/subtitles", (req, res) => {
+  app.post("/api/subtitles", mcpCorsMiddleware, (req, res) => {
     const body = req.body;
     const timings = body.clipId ? getClipRecord(body.clipId)?.wordTimings : body.wordTimings;
     if (!timings || timings.length === 0) {
       res.status(404).json({ error: "No word timings found for subtitle generation." });
       return;
     }
+    const granularity = body.wordLevel || body.granularity === "word" ? "word" : "phrase";
     const content = generateSubtitles({
       wordTimings: timings,
       format: body.format || "srt",
+      granularity,
+      wordLevel: granularity === "word",
       preset: body.preset || "rainbow_reels",
       maxLines: body.maxLines || 3,
       maxCharsPerLine: body.maxCharsPerLine,
-      maxPhraseDurationMs: body.maxPhraseDurationMs
+      maxPhraseDurationMs: body.maxPhraseDurationMs,
+      maxDurationSeconds: body.maxDurationSeconds
     });
-    res.json({ format: body.format || "srt", content });
+    res.json({ format: body.format || "srt", granularity, content });
   });
   app.get("/api/clips", (_req, res) => {
     res.json({ clips: listRecentClips(30) });
@@ -4657,6 +5942,7 @@ async function startServer() {
       clipId: record.id,
       audioUrl: `${base}${audioPath}`,
       downloadUrl: `${base}${audioPath}?download=1`,
+      wordSrtUrl: `${base}/api/clips/${record.id}/subtitles/srt?granularity=word&download=1`,
       mimeType: record.mimeType,
       format: record.format,
       sampleRate: record.sampleRate,
@@ -4705,6 +5991,103 @@ async function startServer() {
         Boolean(preserveDuration)
       );
       res.json({ translatedText });
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/script/localize", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const body = req.body;
+      const localized = await localizeNarration({
+        text: body.text || "",
+        targetLanguages: body.targetLanguages?.length ? body.targetLanguages : ["hi"],
+        voiceId: body.voiceId,
+        preserveDuration: body.preserveDuration,
+        targetDurationSeconds: body.targetDurationSeconds
+      });
+      res.json({ localizations: localized });
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/audio/transcribe", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const { buffer, mimeType } = await resolveInputAudioBuffer(req.body || {});
+      const transcript = await transcribeAudioBuffer(buffer, mimeType);
+      res.json({ transcript });
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/audio/analyze-voice", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const { buffer, mimeType } = await resolveInputAudioBuffer(req.body || {});
+      const analysis = await analyzeVoiceBuffer(buffer, mimeType);
+      res.json(analysis);
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/audio/clone-preset", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const { buffer, mimeType } = await resolveInputAudioBuffer({
+        clipId: body.clipId,
+        audioUrl: body.audioUrl,
+        audioBase64: body.audioBase64,
+        audioFile: body.mimeType ? { mime_type: body.mimeType } : void 0
+      });
+      if (!buffer || buffer.length < 256) {
+        res.status(400).json({ error: "Recorded or uploaded audio sample is empty." });
+        return;
+      }
+      const cloned = await createClonedVoicePreset({
+        buffer,
+        mimeType: body.mimeType || mimeType,
+        presetName: body.presetName || "My Studio Voice",
+        language: body.language || "en",
+        optionalAiAnalyze: (buf, mt) => analyzeVoiceBuffer(buf, mt)
+      });
+      res.json(cloned);
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/audio/match-duration", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const body = req.body;
+      const { buffer, sourceText } = await resolveInputAudioBuffer(body);
+      const result = await matchAudioDuration({
+        buffer,
+        targetDurationSeconds: Number(body.targetDurationSeconds || 5),
+        sampleRate: body.sampleRate,
+        channels: body.channels,
+        sourceText
+      });
+      res.json(result);
+    } catch (error) {
+      const mapped = mapApiError(error);
+      res.status(mapped.status).json({ error: mapped.message, ...mapped });
+    }
+  });
+  app.post("/api/audio/replace-segment", mcpCorsMiddleware, async (req, res) => {
+    try {
+      const body = req.body;
+      const { buffer } = await resolveInputAudioBuffer(body);
+      const result = await replaceAudioSegmentFromBuffer({
+        buffer,
+        startMs: Number(body.startMs || 0),
+        endMs: Number(body.endMs || 500),
+        replacementText: body.replacementText || "",
+        voiceId: body.voiceId,
+        language: body.language
+      });
+      res.json(result);
     } catch (error) {
       const mapped = mapApiError(error);
       res.status(mapped.status).json({ error: mapped.message, ...mapped });
@@ -4774,6 +6157,73 @@ async function startServer() {
     }
     res.json({ project: proj });
   });
+  app.post("/api/projects/:id/clips", mcpCorsMiddleware, (req, res) => {
+    const projectId = String(req.params.id);
+    const body = req.body;
+    if (!body.clipId?.trim()) {
+      res.status(400).json({ error: "clipId is required." });
+      return;
+    }
+    const rec = getClipRecord(body.clipId.trim());
+    if (!rec) {
+      res.status(404).json({ error: `Clip '${body.clipId}' not found.` });
+      return;
+    }
+    const updated = addClipToProject(projectId, {
+      clipId: rec.id,
+      title: body.title || rec.displayText.slice(0, 48),
+      text: rec.displayText,
+      voiceId: rec.voiceId,
+      voiceName: rec.voiceName,
+      language: rec.language,
+      durationMs: rec.durationMs,
+      sampleRate: rec.sampleRate,
+      channels: rec.channels,
+      audioUrl: `/api/clips/${rec.id}.${rec.format}`,
+      downloadUrl: `/api/clips/${rec.id}.${rec.format}?download=1`
+    });
+    if (!updated) {
+      res.status(404).json({ error: `Project '${projectId}' not found.` });
+      return;
+    }
+    res.json({ project: updated });
+  });
+  app.patch("/api/projects/:id/clips/:clipId", mcpCorsMiddleware, (req, res) => {
+    const body = req.body;
+    const updated = updateProjectClip(String(req.params.id), String(req.params.clipId), body);
+    if (!updated) {
+      res.status(404).json({ error: "Project or clip not found." });
+      return;
+    }
+    res.json({ project: updated });
+  });
+  app.delete("/api/projects/:id/clips/:clipId", mcpCorsMiddleware, (req, res) => {
+    const updated = deleteProjectClip(String(req.params.id), String(req.params.clipId));
+    if (!updated) {
+      res.status(404).json({ error: "Project not found." });
+      return;
+    }
+    res.json({ project: updated });
+  });
+  app.get("/api/projects/:id/export", mcpCorsMiddleware, (req, res) => {
+    const proj = getProject(String(req.params.id));
+    if (!proj) {
+      res.status(404).json({ error: "Project not found." });
+      return;
+    }
+    const base = resolvePublicBaseUrl(req);
+    res.json({
+      ...proj,
+      clips: proj.clips.map((c) => ({
+        ...c,
+        audioUrl: `${base}${c.audioUrl}`,
+        downloadUrl: `${base}${c.downloadUrl}`,
+        srtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?download=1`,
+        wordSrtUrl: `${base}/api/clips/${c.clipId}/subtitles/srt?granularity=word&download=1`,
+        assUrl: `${base}/api/clips/${c.clipId}/subtitles/ass?preset=rainbow_reels&download=1`
+      }))
+    });
+  });
   app.all("/mcp", mcpCorsMiddleware, async (req, res) => {
     if (req.method !== "POST") {
       res.status(405).json({
@@ -4838,11 +6288,11 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path3.resolve(__dirname, "dist");
+    const distPath = path5.resolve(__dirname, "dist");
     app.use(express.static(distPath));
     app.get("/{*path}", (_req, res) => {
-      const indexFile = path3.join(distPath, "index.html");
-      if (fs3.existsSync(indexFile)) {
+      const indexFile = path5.join(distPath, "index.html");
+      if (fs5.existsSync(indexFile)) {
         res.sendFile(indexFile);
       } else {
         res.status(404).send("Production build not found. Run npm run build.");

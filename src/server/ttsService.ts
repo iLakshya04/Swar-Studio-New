@@ -19,14 +19,17 @@ import {
   alignWordsToEnvelope,
   alignWordsToWavPcm,
   generateSubtitles,
+  generateWordLevelSrt,
 } from '../utils/subtitleGenerator';
 import type {
   AudioFormat,
   ChannelCount,
+  EngineTier,
   GenerateRequestPayload,
   GenerateResponsePayload,
   LanguageMode,
   MasteringPreset,
+  PitchRegister,
   PrebuiltVoiceName,
   SampleRateHz,
   SpeakerConfig,
@@ -34,6 +37,11 @@ import type {
   TimingSource,
   WordTiming,
 } from '../types';
+import {
+  synthesizeKeylessGoogleTts,
+  synthesizeKeylessNeuralTts,
+  translateScriptKeyless,
+} from './keylessTts';
 import {
   InputValidationError,
   QuotaExhaustedError,
@@ -70,12 +78,10 @@ export function getClip(id: string) {
   return getClipAudioBuffer(id, false);
 }
 
-export function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured. Please add your API key in Settings > Secrets.'
-    );
+export function getGeminiClientOptional(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    return null;
   }
   return new GoogleGenAI({
     apiKey,
@@ -88,6 +94,16 @@ export function getGeminiClient(): GoogleGenAI {
   });
 }
 
+export function getGeminiClient(): GoogleGenAI {
+  const client = getGeminiClientOptional();
+  if (!client) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured. Please add your API key in Settings > Secrets.'
+    );
+  }
+  return client;
+}
+
 // Short-lived cache of synthesized chunks so partial multi-chunk failures can resume without re-calling completed chunks
 const chunkSynthesisCache = new Map<
   string,
@@ -96,14 +112,21 @@ const chunkSynthesisCache = new Map<
 const MAX_CHUNK_CACHE = 80;
 
 function makeChunkCacheKey(params: {
+  voiceId?: string;
   voiceName: string;
+  language?: LanguageMode;
+  pitchRegister?: PitchRegister;
+  speed?: number;
+  modelTier?: EngineTier;
   styleInstruction: string;
   text: string;
   seed?: number;
 }): string {
   return crypto
     .createHash('sha1')
-    .update(`${params.voiceName}|${params.styleInstruction}|${params.seed ?? ''}|${params.text}`)
+    .update(
+      `${params.modelTier ?? ''}|${params.voiceId ?? ''}|${params.voiceName}|${params.language ?? ''}|${params.pitchRegister ?? ''}|${params.speed ?? 1}|${params.styleInstruction}|${params.seed ?? ''}|${params.text}`
+    )
     .digest('hex');
 }
 
@@ -129,18 +152,38 @@ const GEMINI_EXPRESSIVE_CHAIN = [
   'gemini-2.5-pro-preview-tts',
 ] as const;
 
-function buildCandidateChain(preferredModel: string, modelTier: 'standard' | 'expressive'): string[] {
-  const baseList: string[] =
-    modelTier === 'expressive'
-      ? [...GEMINI_EXPRESSIVE_CHAIN]
-      : [...GEMINI_STANDARD_CHAIN];
+const KEYLESS_CHAIN = ['keyless:neural-tts', 'keyless:google-tts'] as const;
 
-  const ordered = [preferredModel, ...baseList.filter((m) => m !== preferredModel)];
+function buildCandidateChain(
+  preferredModel: string,
+  modelTier: EngineTier,
+  hasGemini: boolean
+): string[] {
+  if (modelTier === 'keyless') {
+    return preferredModel === 'keyless:google-tts'
+      ? ['keyless:google-tts']
+      : [...KEYLESS_CHAIN];
+  }
+
+  const ordered: string[] = [];
+  if (hasGemini) {
+    const baseList: string[] =
+      modelTier === 'expressive'
+        ? [...GEMINI_EXPRESSIVE_CHAIN]
+        : [...GEMINI_STANDARD_CHAIN];
+    ordered.push(preferredModel, ...baseList.filter((m) => m !== preferredModel));
+  }
   if (process.env.OPENAI_API_KEY?.trim()) {
     ordered.push('openai:gpt-4o-mini-tts');
   }
   if (process.env.ELEVENLABS_API_KEY?.trim()) {
     ordered.push('elevenlabs:eleven_multilingual_v2');
+  }
+  // Always append keyless unlimited providers so generation succeeds without API keys or quota
+  for (const keylessModel of KEYLESS_CHAIN) {
+    if (!ordered.includes(keylessModel)) {
+      ordered.push(keylessModel);
+    }
   }
   return ordered;
 }
@@ -327,11 +370,15 @@ async function callElevenLabsTts(params: {
 }
 
 async function synthesizeSingleChunkAcrossProviders(params: {
-  ai: GoogleGenAI;
+  ai: GoogleGenAI | null;
   preferredModel: string;
-  modelTier: 'standard' | 'expressive';
+  modelTier: EngineTier;
   text: string;
+  voiceId?: string;
   voiceName: PrebuiltVoiceName;
+  language?: LanguageMode;
+  pitchRegister?: PitchRegister;
+  speed?: number;
   styleInstruction: string;
   seed?: number;
   useChunkCache?: boolean;
@@ -344,7 +391,7 @@ async function synthesizeSingleChunkAcrossProviders(params: {
     }
   }
 
-  const candidates = buildCandidateChain(params.preferredModel, params.modelTier);
+  const candidates = buildCandidateChain(params.preferredModel, params.modelTier, Boolean(params.ai));
   const attemptedModels: string[] = [];
   let sawQuota = false;
   let maxRetryAfter = 0;
@@ -362,7 +409,25 @@ async function synthesizeSingleChunkAcrossProviders(params: {
     attemptedModels.push(candidate);
     try {
       let buffer: Buffer;
-      if (candidate === 'openai:gpt-4o-mini-tts') {
+      if (candidate === 'keyless:neural-tts') {
+        buffer = await synthesizeKeylessNeuralTts({
+          text: params.text,
+          voiceId: params.voiceId,
+          voiceName: params.voiceName,
+          language: params.language,
+          pitchRegister: params.pitchRegister,
+          speed: params.speed,
+        });
+      } else if (candidate === 'keyless:google-tts') {
+        buffer = await synthesizeKeylessGoogleTts({
+          text: params.text,
+          voiceId: params.voiceId,
+          voiceName: params.voiceName,
+          language: params.language,
+          pitchRegister: params.pitchRegister,
+          speed: params.speed,
+        });
+      } else if (candidate === 'openai:gpt-4o-mini-tts') {
         buffer = await callOpenAiTts({
           text: params.text,
           voiceName: params.voiceName,
@@ -374,6 +439,9 @@ async function synthesizeSingleChunkAcrossProviders(params: {
           voiceName: params.voiceName,
         });
       } else {
+        if (!params.ai) {
+          continue;
+        }
         buffer = await callGeminiSingleTtsModel({
           ai: params.ai,
           model: candidate,
@@ -403,10 +471,13 @@ async function synthesizeSingleChunkAcrossProviders(params: {
         continue;
       }
 
-      // If this isn't the last candidate and looks like a fallback format/model compatibility error, advance cleanly
+      // If this isn't the last candidate and looks like a fallback format/model/provider error, advance cleanly
       lastNonQuotaError = err;
       const errStatus = (err as { status?: number })?.status;
-      if (i < candidates.length - 1 && (errStatus === 400 || errStatus === 502 || errStatus === 503)) {
+      if (
+        i < candidates.length - 1 &&
+        (candidate.startsWith('keyless:') || errStatus === 400 || errStatus === 502 || errStatus === 503)
+      ) {
         continue;
       }
       throw err;
@@ -495,7 +566,10 @@ export async function synthesizeSpeech(
 
   const mode = payload.mode === 'multi' ? 'multi' : 'single';
   const language: LanguageMode = payload.language || 'en';
-  const modelTier = payload.modelTier === 'expressive' ? 'expressive' : 'standard';
+  const modelTier: EngineTier =
+    payload.modelTier === 'expressive' || payload.modelTier === 'keyless'
+      ? payload.modelTier
+      : 'standard';
   const speed = clampSpeed(typeof payload.speed === 'number' ? payload.speed : 1.0);
   const pitchRegister = payload.pitchRegister || 'balanced';
   const emotionIntensity = payload.emotionIntensity || 'natural';
@@ -532,7 +606,7 @@ export async function synthesizeSpeech(
     dialogueLines: payload.dialogueLines,
   });
 
-  const ai = getGeminiClient();
+  const ai = getGeminiClientOptional();
   const appliedPronunciations = new Set<string>();
 
   let rawMasterWav: Buffer | null = null;
@@ -605,7 +679,7 @@ export async function synthesizeSpeech(
       const nativeMultiModel = 'gemini-3.8-flash-tts';
       let nativeSuccess = false;
 
-      if (!isModelOnCooldown(nativeMultiModel)) {
+      if (ai && modelTier !== 'keyless' && !isModelOnCooldown(nativeMultiModel)) {
         try {
           const response = await ai.models.generateContent({
             model: nativeMultiModel,
@@ -645,7 +719,7 @@ export async function synthesizeSpeech(
       }
 
       if (!nativeSuccess) {
-        // Fallback: synthesize each dialogue turn across full fallback chain and stitch
+        // Fallback: synthesize each dialogue turn across full fallback chain (including keyless TTS) and stitch
         const fallbackBuffers: Buffer[] = [];
         for (const line of nonEmptyLines) {
           const speaker = line.speakerKey === keyA ? spA : spB;
@@ -663,10 +737,14 @@ export async function synthesizeSpeech(
           });
           const resTurn = await synthesizeSingleChunkAcrossProviders({
             ai,
-            preferredModel: 'gemini-3.8-flash-lite-tts',
-            modelTier: 'standard',
+            preferredModel: modelTier === 'keyless' ? 'keyless:neural-tts' : 'gemini-3.8-flash-lite-tts',
+            modelTier: modelTier === 'keyless' ? 'keyless' : 'standard',
             text: pron.ttsText,
+            voiceId: speaker.voiceId,
             voiceName: speaker.baseVoice || 'Puck',
+            language,
+            pitchRegister,
+            speed,
             styleInstruction: speakerStyle,
             seed: payload.seed,
             useChunkCache: true,
@@ -706,7 +784,11 @@ export async function synthesizeSpeech(
           preferredModel: actualModelUsed,
           modelTier,
           text: pron.ttsText,
+          voiceId: sp.voiceId,
           voiceName: sp.baseVoice || 'Puck',
+          language,
+          pitchRegister,
+          speed,
           styleInstruction,
           seed: payload.seed,
           useChunkCache: true,
@@ -792,7 +874,11 @@ export async function synthesizeSpeech(
           preferredModel: actualModelUsed,
           modelTier,
           text: pron.ttsText,
+          voiceId,
           voiceName,
+          language,
+          pitchRegister,
+          speed,
           styleInstruction: segStyle,
           seed: payload.seed,
           useChunkCache: true,
@@ -914,7 +1000,11 @@ export async function synthesizeSpeech(
           preferredModel: actualModelUsed,
           modelTier,
           text: singleText,
+          voiceId,
           voiceName,
+          language,
+          pitchRegister,
+          speed,
           styleInstruction: baseStyleInstruction,
           seed: payload.seed,
           useChunkCache: false,
@@ -950,7 +1040,11 @@ export async function synthesizeSpeech(
             preferredModel: actualModelUsed,
             modelTier,
             text: chunkCleanText,
+            voiceId,
             voiceName,
+            language,
+            pitchRegister,
+            speed,
             styleInstruction: chunkStyle,
             seed: payload.seed,
             useChunkCache: true,
@@ -1085,11 +1179,13 @@ export async function synthesizeSpeech(
 
   const audioUrl = `/api/clips/${saved.id}.${encoded.actualFormat}`;
   const downloadUrl = `/api/clips/${saved.id}.${encoded.actualFormat}?download=1`;
+  const wordSrtUrl = `/api/clips/${saved.id}/subtitles/srt?granularity=word&download=1`;
 
   return {
     clipId: saved.id,
     audioUrl,
     downloadUrl,
+    wordSrtUrl,
     audioBase64: encoded.buffer.toString('base64'),
     mimeType: encoded.mimeType,
     format: encoded.actualFormat,
@@ -1107,6 +1203,9 @@ export async function synthesizeSpeech(
     ...(payload.returnWordTimings === false
       ? {}
       : { wordTimings, phraseTimings }),
+    ...(payload.includeWordLevelSrt && wordTimings.length > 0
+      ? { wordSrt: generateWordLevelSrt(wordTimings) }
+      : {}),
     speechEnvelope: processed.speechEnvelope,
     ...(payload.returnWaveformPeaks === false
       ? {}
@@ -1152,13 +1251,20 @@ export async function regenerateClipSegment(params: {
     emotionHint: getEmotionStyleHint(nextEmotion),
   });
 
-  const ai = getGeminiClient();
+  const ai = getGeminiClientOptional();
   const segResult = await synthesizeSingleChunkAcrossProviders({
     ai,
     preferredModel: existing.modelUsed || 'gemini-3.8-flash-lite-tts',
-    modelTier: existing.modelUsed === 'gemini-3.8-flash-tts' ? 'expressive' : 'standard',
+    modelTier: existing.modelUsed?.startsWith('keyless:')
+      ? 'keyless'
+      : existing.modelUsed === 'gemini-3.8-flash-tts'
+        ? 'expressive'
+        : 'standard',
     text: pron.ttsText,
+    voiceId: voicePreset.id,
     voiceName: voicePreset.baseVoice,
+    language: existing.language,
+    speed: params.speed ?? 1.0,
     styleInstruction,
     useChunkCache: true,
   });
@@ -1319,39 +1425,44 @@ export async function translateSpeechScript(
     throw new InputValidationError('Enter text to translate or adapt.');
   }
 
-  const ai = getGeminiClient();
+  const ai = getGeminiClientOptional();
 
-  const targetDesc =
-    targetLanguage === 'hi'
-      ? 'natural, spoken Hindi in Devanagari script (हिन्दी)'
-      : targetLanguage === 'bilingual'
-        ? 'natural urban Hinglish (blending Hindi in Devanagari with conversational English phrases where natural)'
-        : 'natural, expressive English';
+  if (ai) {
+    const targetDesc =
+      targetLanguage === 'hi'
+        ? 'natural, spoken Hindi in Devanagari script (हिन्दी)'
+        : targetLanguage === 'bilingual'
+          ? 'natural urban Hinglish (blending Hindi in Devanagari with conversational English phrases where natural)'
+          : 'natural, expressive English';
 
-  const durationRule = preserveDuration
-    ? ' Match the approximate spoken syllable count and sentence pacing of the source so the localized voiceover fits the same video duration.'
-    : '';
+    const durationRule = preserveDuration
+      ? ' Match the approximate spoken syllable count and sentence pacing of the source so the localized voiceover fits the same video duration.'
+      : '';
 
-  const response = await generateTextWithFallback({
-    ai,
-    primaryModel: 'gemini-4-hydrogen',
-    fallbackModel: 'gemini-2.5-flash',
-    contents: `Translate or adapt the following voiceover script into ${targetDesc}.${durationRule} Preserve any inline vocal tags like <breath>, <laugh>, <chuckle>, <sigh>, <gasp>, |yeah|, |mhm|, or [CURIOUS]/[AWE] exactly as written. Return ONLY the adapted script text with no commentary or quotes.\n\nScript:\n${text.trim()}`,
-    config: {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-    },
-  });
+    try {
+      const response = await generateTextWithFallback({
+        ai,
+        primaryModel: 'gemini-4-hydrogen',
+        fallbackModel: 'gemini-2.5-flash',
+        contents: `Translate or adapt the following voiceover script into ${targetDesc}.${durationRule} Preserve any inline vocal tags like <breath>, <laugh>, <chuckle>, <sigh>, <gasp>, |yeah|, |mhm|, or [CURIOUS]/[AWE] exactly as written. Return ONLY the adapted script text with no commentary or quotes.\n\nScript:\n${text.trim()}`,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
+      });
 
-  const translatedText = (response.text ?? '').trim();
-  if (!translatedText) {
-    const err = new Error('Translation returned empty output. Please try again.') as Error & {
-      status?: number;
-    };
-    err.status = 502;
-    throw err;
+      const translatedText = (response.text ?? '').trim();
+      if (translatedText) {
+        return translatedText;
+      }
+    } catch (err) {
+      if (!isQuotaOrRateError(err)) {
+        throw err;
+      }
+      // Fall through to keyless translation when Gemini text quota is exhausted
+    }
   }
 
-  return translatedText;
+  return await translateScriptKeyless(text, targetLanguage);
 }
 
 export async function localizeNarration(params: {

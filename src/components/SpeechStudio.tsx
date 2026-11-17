@@ -36,6 +36,7 @@ import type {
   SpeakerConfig,
   StudioMode,
   SubtitleFormat,
+  SubtitleGranularity,
   VoicePreset,
 } from '../types';
 import {
@@ -97,6 +98,7 @@ interface SpeechStudioProps {
   playbackDuration: number;
   isPlaying: boolean;
   hasAudio: boolean;
+  isDark?: boolean;
   onTogglePlay: () => void;
   onSeek: (seconds: number, autoPlay?: boolean) => void;
   regeneratingSegIdx: number | null;
@@ -156,6 +158,7 @@ export function SpeechStudio({
   playbackDuration,
   isPlaying,
   hasAudio,
+  isDark = false,
   onTogglePlay,
   onSeek,
   regeneratingSegIdx,
@@ -277,18 +280,22 @@ export function SpeechStudio({
     });
   };
 
-  const handleDownloadSubtitles = (format: SubtitleFormat) => {
+  const handleDownloadSubtitles = (
+    format: SubtitleFormat,
+    granularity: SubtitleGranularity = 'phrase'
+  ) => {
     if (!latestResult?.wordTimings?.length) return;
     const subContent = generateSubtitles({
       wordTimings: latestResult.wordTimings,
       format,
+      granularity,
       preset: 'rainbow_reels',
     });
     const blob = new Blob([subContent], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `svara-${latestResult.clipId || 'captions'}.${format}`;
+    anchor.download = `svara-${latestResult.clipId || 'captions'}${granularity === 'word' ? '-words' : ''}.${format}`;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
@@ -629,6 +636,7 @@ export function SpeechStudio({
               currentTime={playbackCurrentTime}
               isPlaying={isPlaying}
               hasAudio={hasAudio}
+              isDark={isDark}
               onTogglePlay={onTogglePlay}
               onSeek={onSeek}
             />
@@ -650,6 +658,7 @@ export function SpeechStudio({
                     {latestResult.durationMs
                       ? `${(latestResult.durationMs / 1000).toFixed(2)}s`
                       : `${latestResult.durationEstimateSec}s`}
+                    {latestResult.modelUsed ? ` · ${latestResult.modelUsed}` : ''}
                     {latestResult.appliedPronunciations?.length
                       ? ` · Pronunciations applied: ${latestResult.appliedPronunciations.join(', ')}`
                       : ''}
@@ -659,7 +668,7 @@ export function SpeechStudio({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
-                    onClick={() => handleDownloadSubtitles('ass')}
+                    onClick={() => handleDownloadSubtitles('ass', 'phrase')}
                     className="inline-flex items-center gap-1.5 px-3 h-8 rounded-lg bg-[#0F172A] dark:bg-[#2563EB] text-white text-xs font-medium hover:bg-slate-800 dark:hover:bg-blue-700 transition-colors whitespace-nowrap"
                   >
                     <Captions className="w-3.5 h-3.5" />
@@ -667,21 +676,29 @@ export function SpeechStudio({
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleDownloadSubtitles('srt')}
+                    onClick={() => handleDownloadSubtitles('srt', 'phrase')}
                     className="px-2.5 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
                   >
                     .SRT
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleDownloadSubtitles('vtt')}
+                    data-testid="studio-download-word-srt"
+                    onClick={() => handleDownloadSubtitles('srt', 'word')}
+                    className="px-2.5 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-[#2563EB] dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    Word .SRT
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadSubtitles('vtt', 'phrase')}
                     className="px-2.5 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
                   >
                     .VTT
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleDownloadSubtitles('json')}
+                    onClick={() => handleDownloadSubtitles('json', 'phrase')}
                     className="px-2.5 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
                   >
                     Word JSON
@@ -1280,8 +1297,10 @@ export function SpeechStudio({
                   onChange={(e) => onEngineTierChange(e.target.value as EngineTier)}
                   className="h-7 px-2 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-[11px] text-[#0F172A] dark:text-slate-100 focus:outline-none focus:border-[#2563EB]"
                 >
-                  <option value="standard">Flash Lite (High Quota)</option>
-                  <option value="expressive">Flash Expressive</option>
+                  <option value="standard">Auto (Gemini + Free Keyless)</option>
+                  <option value="expressive">Expressive (Auto Fallback)</option>
+                  <option value="keyless">Keyless Unlimited (No API Key)</option>
+                  <option value="webspeech">Browser OS Voices (Offline)</option>
                 </select>
               </div>
             </div>

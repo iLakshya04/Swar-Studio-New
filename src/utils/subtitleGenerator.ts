@@ -2,6 +2,7 @@ import type {
   PhraseTiming,
   SpeechEnvelopeInterval,
   SubtitleFormat,
+  SubtitleGranularity,
   SubtitlePreset,
   TimingSource,
   WordTiming,
@@ -400,6 +401,8 @@ function formatAssTime(ms: number): string {
 export interface GenerateSubtitlesOptions {
   wordTimings: WordTiming[];
   format: SubtitleFormat;
+  granularity?: SubtitleGranularity;
+  wordLevel?: boolean;
   preset?: SubtitlePreset;
   maxLines?: 1 | 2 | 3;
   maxCharsPerLine?: number;
@@ -409,9 +412,32 @@ export interface GenerateSubtitlesOptions {
   uppercase?: boolean;
 }
 
+export function generateWordLevelSrt(
+  wordTimings: WordTiming[],
+  opts: { uppercase?: boolean } = {}
+): string {
+  if (!Array.isArray(wordTimings) || wordTimings.length === 0) return '';
+  return wordTimings
+    .filter((w) => w && typeof w.word === 'string' && w.word.trim().length > 0)
+    .map((w, idx) => {
+      const startMs = Math.max(
+        0,
+        Math.round(Number.isFinite(w.startMs) ? w.startMs : (w.startSeconds || 0) * 1000)
+      );
+      const rawEndMs = Math.round(
+        Number.isFinite(w.endMs) ? w.endMs : (w.endSeconds || 0) * 1000
+      );
+      const endMs = Math.max(startMs + 20, rawEndMs);
+      const text = opts.uppercase ? w.word.trim().toUpperCase() : w.word.trim();
+      return `${idx + 1}\n${formatSrtTime(startMs)} --> ${formatSrtTime(endMs)}\n${text}`;
+    })
+    .join('\n\n');
+}
+
 export function generateSubtitles(opts: GenerateSubtitlesOptions): string {
   const isRainbow = (opts.preset ?? 'rainbow_reels') === 'rainbow_reels';
-  const uppercase = opts.uppercase ?? isRainbow;
+  const isWordLevel = opts.granularity === 'word' || opts.wordLevel === true;
+  const uppercase = opts.uppercase ?? (isRainbow && !isWordLevel);
   const maxLines = opts.maxLines ?? (isRainbow ? 3 : 2);
   const maxCharsPerLine = opts.maxCharsPerLine ?? (isRainbow ? 22 : 38);
   const maxPhraseDurationMs =
@@ -423,17 +449,45 @@ export function generateSubtitles(opts: GenerateSubtitlesOptions): string {
         : 3800);
   const marginV = opts.safeAreaMarginV ?? (isRainbow ? 340 : 120);
 
-  const phrases = groupWordsIntoPhrases(opts.wordTimings, {
-    maxLines,
-    maxCharsPerLine,
-    maxPhraseDurationMs,
-    uppercase,
-  });
+  const phrases: PhraseTiming[] = isWordLevel
+    ? opts.wordTimings
+        .filter((w) => w && typeof w.word === 'string' && w.word.trim().length > 0)
+        .map((w) => {
+          const sMs = Math.max(
+            0,
+            Math.round(Number.isFinite(w.startMs) ? w.startMs : (w.startSeconds || 0) * 1000)
+          );
+          const eMs = Math.max(
+            sMs + 20,
+            Math.round(Number.isFinite(w.endMs) ? w.endMs : (w.endSeconds || 0) * 1000)
+          );
+          return {
+            text: uppercase ? w.word.trim().toUpperCase() : w.word.trim(),
+            startMs: sMs,
+            endMs: eMs,
+            words: [
+              {
+                ...w,
+                startMs: sMs,
+                endMs: eMs,
+                startSeconds: Number((sMs / 1000).toFixed(3)),
+                endSeconds: Number((eMs / 1000).toFixed(3)),
+              },
+            ],
+          };
+        })
+    : groupWordsIntoPhrases(opts.wordTimings, {
+        maxLines,
+        maxCharsPerLine,
+        maxPhraseDurationMs,
+        uppercase,
+      });
 
   if (opts.format === 'json') {
     return JSON.stringify(
       {
         preset: opts.preset ?? 'rainbow_reels',
+        granularity: isWordLevel ? 'word' : 'phrase',
         wordTimings: opts.wordTimings,
         phrases,
       },

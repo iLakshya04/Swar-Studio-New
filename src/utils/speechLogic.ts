@@ -120,7 +120,18 @@ export function selectTtsModel(params: {
   text: string;
   customVoiceDescription?: string;
   dialogueLines?: DialogueLine[];
-}): 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts' {
+}): 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts' | 'keyless:neural-tts' | 'keyless:google-tts' | 'webspeech:os-voice' {
+  if (params.modelTier === 'webspeech') {
+    return 'webspeech:os-voice';
+  }
+  if (params.modelTier === 'keyless') {
+    const combinedText =
+      params.mode === 'multi' && params.dialogueLines?.length
+        ? params.dialogueLines.map((l) => l.text).join(' ')
+        : params.text;
+    const lang = detectScriptLanguage(combinedText);
+    return lang === 'en' ? 'keyless:neural-tts' : 'keyless:google-tts';
+  }
   if (params.mode === 'multi' || params.modelTier === 'expressive') {
     return 'gemini-3.8-flash-tts';
   }

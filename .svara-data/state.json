@@ -100,6 +100,1350 @@
   "projects": [],
   "clips": [
     {
+      "id": "55bc4d68-a5d",
+      "wavFileName": "55bc4d68-a5d.wav",
+      "format": "wav",
+      "mimeType": "audio/wav",
+      "sampleRate": 48000,
+      "channels": 1,
+      "durationMs": 3870,
+      "sizeBytes": 371564,
+      "voiceId": "ethan",
+      "voiceName": "Ethan (Deep Cinematic Narrator)",
+      "modelUsed": "gemini-2.5-flash-preview-tts",
+      "language": "en",
+      "displayText": "Blue jets leap upward above thunderclouds.",
+      "stylePrompt": "Clear documentary narrator",
+      "speed": 1,
+      "masteringPreset": "none",
+      "timingSource": "forced_alignment",
+      "timingConfidence": 0.94,
+      "wordTimings": [
+        {
+          "word": "Blue",
+          "startMs": 70,
+          "endMs": 490,
+          "startSeconds": 0.07,
+          "endSeconds": 0.49,
+          "segmentIndex": 0
+        },
+        {
+          "word": "jets",
+          "startMs": 490,
+          "endMs": 840,
+          "startSeconds": 0.49,
+          "endSeconds": 0.84,
+          "segmentIndex": 0
+        },
+        {
+          "word": "leap",
+          "startMs": 840,
+          "endMs": 1050,
+          "startSeconds": 0.84,
+          "endSeconds": 1.05,
+          "segmentIndex": 0
+        },
+        {
+          "word": "upward",
+          "startMs": 1050,
+          "endMs": 1710,
+          "startSeconds": 1.05,
+          "endSeconds": 1.71,
+          "segmentIndex": 0
+        },
+        {
+          "word": "above",
+          "startMs": 1710,
+          "endMs": 2700,
+          "startSeconds": 1.71,
+          "endSeconds": 2.7,
+          "segmentIndex": 0
+        },
+        {
+          "word": "thunderclouds.",
+          "startMs": 2700,
+          "endMs": 3720,
+          "startSeconds": 2.7,
+          "endSeconds": 3.72,
+          "segmentIndex": 0
+        }
+      ],
+      "phraseTimings": [
+        {
+          "text": "Blue jets leap upward above",
+          "startMs": 70,
+          "endMs": 2700,
+          "words": [
+            {
+              "word": "Blue",
+              "startMs": 70,
+              "endMs": 490,
+              "startSeconds": 0.07,
+              "endSeconds": 0.49,
+              "segmentIndex": 0
+            },
+            {
+              "word": "jets",
+              "startMs": 490,
+              "endMs": 840,
+              "startSeconds": 0.49,
+              "endSeconds": 0.84,
+              "segmentIndex": 0
+            },
+            {
+              "word": "leap",
+              "startMs": 840,
+              "endMs": 1050,
+              "startSeconds": 0.84,
+              "endSeconds": 1.05,
+              "segmentIndex": 0
+            },
+            {
+              "word": "upward",
+              "startMs": 1050,
+              "endMs": 1710,
+              "startSeconds": 1.05,
+              "endSeconds": 1.71,
+              "segmentIndex": 0
+            },
+            {
+              "word": "above",
+              "startMs": 1710,
+              "endMs": 2700,
+              "startSeconds": 1.71,
+              "endSeconds": 2.7,
+              "segmentIndex": 0
+            }
+          ]
+        },
+        {
+          "text": "thunderclouds.",
+          "startMs": 2700,
+          "endMs": 3720,
+          "words": [
+            {
+              "word": "thunderclouds.",
+              "startMs": 2700,
+              "endMs": 3720,
+              "startSeconds": 2.7,
+              "endSeconds": 3.72,
+              "segmentIndex": 0
+            }
+          ]
+        }
+      ],
+      "speechEnvelope": [
+        {
+          "startMs": 0,
+          "endMs": 25,
+          "speechActive": false,
+          "rmsDb": -71.3,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 25,
+          "endMs": 50,
+          "speechActive": false,
+          "rmsDb": -70.6,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 50,
+          "endMs": 75,
+          "speechActive": true,
+          "rmsDb": -34.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 75,
+          "endMs": 100,
+          "speechActive": true,
+          "rmsDb": -24.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 100,
+          "endMs": 125,
+          "speechActive": true,
+          "rmsDb": -23.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 125,
+          "endMs": 150,
+          "speechActive": true,
+          "rmsDb": -25.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 150,
+          "endMs": 175,
+          "speechActive": true,
+          "rmsDb": -26.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 175,
+          "endMs": 200,
+          "speechActive": true,
+          "rmsDb": -19.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 200,
+          "endMs": 225,
+          "speechActive": true,
+          "rmsDb": -11.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 225,
+          "endMs": 250,
+          "speechActive": true,
+          "rmsDb": -8.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 250,
+          "endMs": 275,
+          "speechActive": true,
+          "rmsDb": -8.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 275,
+          "endMs": 300,
+          "speechActive": true,
+          "rmsDb": -6.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 300,
+          "endMs": 325,
+          "speechActive": true,
+          "rmsDb": -7.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 325,
+          "endMs": 350,
+          "speechActive": true,
+          "rmsDb": -11.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 350,
+          "endMs": 375,
+          "speechActive": true,
+          "rmsDb": -13.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 375,
+          "endMs": 400,
+          "speechActive": true,
+          "rmsDb": -12.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 400,
+          "endMs": 425,
+          "speechActive": true,
+          "rmsDb": -12,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 425,
+          "endMs": 450,
+          "speechActive": true,
+          "rmsDb": -12.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 450,
+          "endMs": 475,
+          "speechActive": true,
+          "rmsDb": -16,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 475,
+          "endMs": 500,
+          "speechActive": true,
+          "rmsDb": -21.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 500,
+          "endMs": 525,
+          "speechActive": true,
+          "rmsDb": -21.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 525,
+          "endMs": 550,
+          "speechActive": true,
+          "rmsDb": -20.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 550,
+          "endMs": 575,
+          "speechActive": true,
+          "rmsDb": -15.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 575,
+          "endMs": 600,
+          "speechActive": true,
+          "rmsDb": -13.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 600,
+          "endMs": 625,
+          "speechActive": true,
+          "rmsDb": -7.2,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 625,
+          "endMs": 650,
+          "speechActive": true,
+          "rmsDb": -6.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 650,
+          "endMs": 675,
+          "speechActive": true,
+          "rmsDb": -10.2,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 675,
+          "endMs": 700,
+          "speechActive": true,
+          "rmsDb": -12.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 700,
+          "endMs": 725,
+          "speechActive": true,
+          "rmsDb": -14.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 725,
+          "endMs": 750,
+          "speechActive": true,
+          "rmsDb": -18,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 750,
+          "endMs": 775,
+          "speechActive": true,
+          "rmsDb": -23,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 775,
+          "endMs": 800,
+          "speechActive": true,
+          "rmsDb": -26,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 800,
+          "endMs": 825,
+          "speechActive": true,
+          "rmsDb": -33.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 825,
+          "endMs": 850,
+          "speechActive": false,
+          "rmsDb": -50.7,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 850,
+          "endMs": 875,
+          "speechActive": true,
+          "rmsDb": -35.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 875,
+          "endMs": 900,
+          "speechActive": true,
+          "rmsDb": -22.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 900,
+          "endMs": 925,
+          "speechActive": true,
+          "rmsDb": -20.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 925,
+          "endMs": 950,
+          "speechActive": true,
+          "rmsDb": -22.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 950,
+          "endMs": 975,
+          "speechActive": true,
+          "rmsDb": -24.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 975,
+          "endMs": 1000,
+          "speechActive": true,
+          "rmsDb": -34.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1000,
+          "endMs": 1025,
+          "speechActive": true,
+          "rmsDb": -36.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1025,
+          "endMs": 1050,
+          "speechActive": false,
+          "rmsDb": -61.8,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1050,
+          "endMs": 1075,
+          "speechActive": false,
+          "rmsDb": -57.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1075,
+          "endMs": 1100,
+          "speechActive": true,
+          "rmsDb": -31.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1100,
+          "endMs": 1125,
+          "speechActive": true,
+          "rmsDb": -16.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1125,
+          "endMs": 1150,
+          "speechActive": true,
+          "rmsDb": -14.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1150,
+          "endMs": 1175,
+          "speechActive": true,
+          "rmsDb": -13.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1175,
+          "endMs": 1200,
+          "speechActive": true,
+          "rmsDb": -11.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1200,
+          "endMs": 1225,
+          "speechActive": true,
+          "rmsDb": -14.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1225,
+          "endMs": 1250,
+          "speechActive": true,
+          "rmsDb": -16.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1250,
+          "endMs": 1275,
+          "speechActive": true,
+          "rmsDb": -17.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1275,
+          "endMs": 1300,
+          "speechActive": true,
+          "rmsDb": -28.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1300,
+          "endMs": 1325,
+          "speechActive": false,
+          "rmsDb": -45.1,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1325,
+          "endMs": 1350,
+          "speechActive": false,
+          "rmsDb": -41.6,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1350,
+          "endMs": 1375,
+          "speechActive": false,
+          "rmsDb": -38.7,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1375,
+          "endMs": 1400,
+          "speechActive": false,
+          "rmsDb": -51,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1400,
+          "endMs": 1425,
+          "speechActive": false,
+          "rmsDb": -68.2,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1425,
+          "endMs": 1450,
+          "speechActive": false,
+          "rmsDb": -70.8,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1450,
+          "endMs": 1475,
+          "speechActive": false,
+          "rmsDb": -67.9,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1475,
+          "endMs": 1500,
+          "speechActive": true,
+          "rmsDb": -21.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1500,
+          "endMs": 1525,
+          "speechActive": true,
+          "rmsDb": -9.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1525,
+          "endMs": 1550,
+          "speechActive": true,
+          "rmsDb": -10,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1550,
+          "endMs": 1575,
+          "speechActive": true,
+          "rmsDb": -11.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1575,
+          "endMs": 1600,
+          "speechActive": true,
+          "rmsDb": -18.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1600,
+          "endMs": 1625,
+          "speechActive": false,
+          "rmsDb": -43.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1625,
+          "endMs": 1650,
+          "speechActive": false,
+          "rmsDb": -51.3,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1650,
+          "endMs": 1675,
+          "speechActive": false,
+          "rmsDb": -41.8,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1675,
+          "endMs": 1700,
+          "speechActive": false,
+          "rmsDb": -45,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1700,
+          "endMs": 1725,
+          "speechActive": true,
+          "rmsDb": -32,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1725,
+          "endMs": 1750,
+          "speechActive": true,
+          "rmsDb": -16.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1750,
+          "endMs": 1775,
+          "speechActive": true,
+          "rmsDb": -14.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1775,
+          "endMs": 1800,
+          "speechActive": true,
+          "rmsDb": -16.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1800,
+          "endMs": 1825,
+          "speechActive": true,
+          "rmsDb": -20.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1825,
+          "endMs": 1850,
+          "speechActive": true,
+          "rmsDb": -21.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1850,
+          "endMs": 1875,
+          "speechActive": true,
+          "rmsDb": -25.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1875,
+          "endMs": 1900,
+          "speechActive": true,
+          "rmsDb": -26.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1900,
+          "endMs": 1925,
+          "speechActive": true,
+          "rmsDb": -27.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1925,
+          "endMs": 1950,
+          "speechActive": true,
+          "rmsDb": -33.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 1950,
+          "endMs": 1975,
+          "speechActive": false,
+          "rmsDb": -53,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 1975,
+          "endMs": 2000,
+          "speechActive": true,
+          "rmsDb": -35.2,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2000,
+          "endMs": 2025,
+          "speechActive": true,
+          "rmsDb": -36.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2025,
+          "endMs": 2050,
+          "speechActive": false,
+          "rmsDb": -44.9,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2050,
+          "endMs": 2075,
+          "speechActive": false,
+          "rmsDb": -53.6,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2075,
+          "endMs": 2100,
+          "speechActive": false,
+          "rmsDb": -67.7,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2100,
+          "endMs": 2125,
+          "speechActive": false,
+          "rmsDb": -71.2,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2125,
+          "endMs": 2150,
+          "speechActive": false,
+          "rmsDb": -71.6,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2150,
+          "endMs": 2175,
+          "speechActive": false,
+          "rmsDb": -71.1,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2175,
+          "endMs": 2200,
+          "speechActive": false,
+          "rmsDb": -63.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2200,
+          "endMs": 2225,
+          "speechActive": false,
+          "rmsDb": -62.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2225,
+          "endMs": 2250,
+          "speechActive": true,
+          "rmsDb": -13.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2250,
+          "endMs": 2275,
+          "speechActive": true,
+          "rmsDb": -11.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2275,
+          "endMs": 2300,
+          "speechActive": true,
+          "rmsDb": -12.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2300,
+          "endMs": 2325,
+          "speechActive": true,
+          "rmsDb": -21.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2325,
+          "endMs": 2350,
+          "speechActive": true,
+          "rmsDb": -28.1,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2350,
+          "endMs": 2375,
+          "speechActive": true,
+          "rmsDb": -35.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2375,
+          "endMs": 2400,
+          "speechActive": true,
+          "rmsDb": -36.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2400,
+          "endMs": 2425,
+          "speechActive": true,
+          "rmsDb": -18.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2425,
+          "endMs": 2450,
+          "speechActive": true,
+          "rmsDb": -7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2450,
+          "endMs": 2475,
+          "speechActive": true,
+          "rmsDb": -9.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2475,
+          "endMs": 2500,
+          "speechActive": true,
+          "rmsDb": -10.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2500,
+          "endMs": 2525,
+          "speechActive": true,
+          "rmsDb": -10.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2525,
+          "endMs": 2550,
+          "speechActive": true,
+          "rmsDb": -12.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2550,
+          "endMs": 2575,
+          "speechActive": true,
+          "rmsDb": -15.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2575,
+          "endMs": 2600,
+          "speechActive": true,
+          "rmsDb": -17.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2600,
+          "endMs": 2625,
+          "speechActive": true,
+          "rmsDb": -19.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2625,
+          "endMs": 2650,
+          "speechActive": true,
+          "rmsDb": -22.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2650,
+          "endMs": 2675,
+          "speechActive": true,
+          "rmsDb": -22,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2675,
+          "endMs": 2700,
+          "speechActive": true,
+          "rmsDb": -28.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2700,
+          "endMs": 2725,
+          "speechActive": true,
+          "rmsDb": -35.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2725,
+          "endMs": 2750,
+          "speechActive": true,
+          "rmsDb": -35.2,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2750,
+          "endMs": 2775,
+          "speechActive": true,
+          "rmsDb": -32.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2775,
+          "endMs": 2800,
+          "speechActive": true,
+          "rmsDb": -35.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2800,
+          "endMs": 2825,
+          "speechActive": true,
+          "rmsDb": -35.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2825,
+          "endMs": 2850,
+          "speechActive": false,
+          "rmsDb": -41.4,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2850,
+          "endMs": 2875,
+          "speechActive": false,
+          "rmsDb": -70.7,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2875,
+          "endMs": 2900,
+          "speechActive": false,
+          "rmsDb": -74.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2900,
+          "endMs": 2925,
+          "speechActive": false,
+          "rmsDb": -49.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 2925,
+          "endMs": 2950,
+          "speechActive": true,
+          "rmsDb": -13.2,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2950,
+          "endMs": 2975,
+          "speechActive": true,
+          "rmsDb": -8.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 2975,
+          "endMs": 3000,
+          "speechActive": true,
+          "rmsDb": -11,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3000,
+          "endMs": 3025,
+          "speechActive": true,
+          "rmsDb": -11.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3025,
+          "endMs": 3050,
+          "speechActive": true,
+          "rmsDb": -10.5,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3050,
+          "endMs": 3075,
+          "speechActive": true,
+          "rmsDb": -15.6,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3075,
+          "endMs": 3100,
+          "speechActive": true,
+          "rmsDb": -19.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3100,
+          "endMs": 3125,
+          "speechActive": true,
+          "rmsDb": -13.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3125,
+          "endMs": 3150,
+          "speechActive": true,
+          "rmsDb": -19.7,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3150,
+          "endMs": 3175,
+          "speechActive": false,
+          "rmsDb": -39.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3175,
+          "endMs": 3200,
+          "speechActive": false,
+          "rmsDb": -42,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3200,
+          "endMs": 3225,
+          "speechActive": true,
+          "rmsDb": -28.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3225,
+          "endMs": 3250,
+          "speechActive": true,
+          "rmsDb": -29.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3250,
+          "endMs": 3275,
+          "speechActive": true,
+          "rmsDb": -21,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3275,
+          "endMs": 3300,
+          "speechActive": true,
+          "rmsDb": -17.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3300,
+          "endMs": 3325,
+          "speechActive": true,
+          "rmsDb": -18,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3325,
+          "endMs": 3350,
+          "speechActive": true,
+          "rmsDb": -18.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3350,
+          "endMs": 3375,
+          "speechActive": true,
+          "rmsDb": -20.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3375,
+          "endMs": 3400,
+          "speechActive": true,
+          "rmsDb": -19.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3400,
+          "endMs": 3425,
+          "speechActive": true,
+          "rmsDb": -23.4,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3425,
+          "endMs": 3450,
+          "speechActive": true,
+          "rmsDb": -23.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3450,
+          "endMs": 3475,
+          "speechActive": true,
+          "rmsDb": -27.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3475,
+          "endMs": 3500,
+          "speechActive": true,
+          "rmsDb": -32,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3500,
+          "endMs": 3525,
+          "speechActive": false,
+          "rmsDb": -44.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3525,
+          "endMs": 3550,
+          "speechActive": false,
+          "rmsDb": -40.3,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3550,
+          "endMs": 3575,
+          "speechActive": false,
+          "rmsDb": -66.2,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3575,
+          "endMs": 3600,
+          "speechActive": true,
+          "rmsDb": -35.9,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3600,
+          "endMs": 3625,
+          "speechActive": true,
+          "rmsDb": -27,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3625,
+          "endMs": 3650,
+          "speechActive": true,
+          "rmsDb": -26.8,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3650,
+          "endMs": 3675,
+          "speechActive": true,
+          "rmsDb": -26.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3675,
+          "endMs": 3700,
+          "speechActive": true,
+          "rmsDb": -29.3,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3700,
+          "endMs": 3725,
+          "speechActive": true,
+          "rmsDb": -36,
+          "duckGainDb": -14
+        },
+        {
+          "startMs": 3725,
+          "endMs": 3750,
+          "speechActive": false,
+          "rmsDb": -46,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3750,
+          "endMs": 3775,
+          "speechActive": false,
+          "rmsDb": -56.2,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3775,
+          "endMs": 3800,
+          "speechActive": false,
+          "rmsDb": -67.7,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3800,
+          "endMs": 3825,
+          "speechActive": false,
+          "rmsDb": -60.8,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3825,
+          "endMs": 3850,
+          "speechActive": false,
+          "rmsDb": -73.5,
+          "duckGainDb": 0
+        },
+        {
+          "startMs": 3850,
+          "endMs": 3870,
+          "speechActive": false,
+          "rmsDb": -70.7,
+          "duckGainDb": 0
+        }
+      ],
+      "waveformPeaks": [
+        0.04,
+        0.04,
+        0.136,
+        0.14,
+        0.127,
+        0.124,
+        0.829,
+        0.829,
+        0.899,
+        0.909,
+        0.621,
+        0.446,
+        0.454,
+        0.432,
+        0.387,
+        0.167,
+        0.519,
+        0.673,
+        0.91,
+        0.996,
+        0.816,
+        0.772,
+        0.66,
+        0.541,
+        0.199,
+        0.07,
+        0.102,
+        0.338,
+        0.427,
+        0.308,
+        0.166,
+        0.047,
+        0.04,
+        0.04,
+        0.435,
+        0.445,
+        0.7,
+        0.529,
+        0.404,
+        0.343,
+        0.04,
+        0.054,
+        0.04,
+        0.04,
+        0.04,
+        0.04,
+        0.986,
+        0.994,
+        0.895,
+        0.12,
+        0.04,
+        0.044,
+        0.04,
+        0.481,
+        0.632,
+        0.479,
+        0.344,
+        0.25,
+        0.199,
+        0.221,
+        0.051,
+        0.072,
+        0.051,
+        0.04,
+        0.04,
+        0.04,
+        0.04,
+        0.04,
+        0.04,
+        0.802,
+        0.984,
+        0.954,
+        0.114,
+        0.04,
+        0.112,
+        1,
+        0.99,
+        0.952,
+        0.864,
+        0.739,
+        0.475,
+        0.296,
+        0.29,
+        0.159,
+        0.063,
+        0.09,
+        0.093,
+        0.073,
+        0.04,
+        0.04,
+        0.261,
+        0.987,
+        0.988,
+        0.804,
+        0.666,
+        0.478,
+        0.745,
+        0.324,
+        0.064,
+        0.153,
+        0.112,
+        0.548,
+        0.595,
+        0.375,
+        0.563,
+        0.304,
+        0.294,
+        0.147,
+        0.115,
+        0.048,
+        0.04,
+        0.174,
+        0.208,
+        0.235,
+        0.14,
+        0.052,
+        0.04,
+        0.04,
+        0.04,
+        0.04
+      ],
+      "createdAt": "2026-11-16T14:40:43.611Z"
+    },
+    {
       "id": "1da329d1-452",
       "wavFileName": "1da329d1-452.wav",
       "format": "wav",

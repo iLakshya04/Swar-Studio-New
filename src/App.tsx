@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { AudioWaveform, Moon, Plus, Sun } from 'lucide-react';
 import { AudioPlayerBar, type ActiveTrack } from './components/AudioPlayerBar';
+import { ConnectionStatusBadge } from './components/ConnectionStatusBadge';
 import { HistoryPanel } from './components/HistoryPanel';
 import { McpConnectPanel } from './components/McpConnectPanel';
 import { PronunciationModal } from './components/PronunciationModal';
 import { SidebarNav, type ActiveTab } from './components/SidebarNav';
 import { SpeechStudio } from './components/SpeechStudio';
+import { VoiceCloningTab } from './components/VoiceCloningTab';
 import { VoiceLibrary } from './components/VoiceLibrary';
 import { DEFAULT_DIALOGUE_LINES, SAMPLE_TEMPLATES, VOICE_PRESETS } from './data/voices';
 import { useAudioPlayback } from './hooks/useAudioPlayback';
@@ -21,6 +23,7 @@ import type {
   MasteringPreset,
   PitchRegister,
   PronunciationEntry,
+  ProviderHealthSnapshot,
   SampleRateHz,
   SavedVoicePresetConfig,
   SpeakerConfig,
@@ -28,9 +31,16 @@ import type {
   VoicePreset,
 } from './types';
 import { generate, regenerateSegment } from './utils/generateClient';
+import {
+  getAvailableWebSpeechVoices,
+  isWebSpeechSupported,
+  stripTagsForWebSpeech,
+  synthesizeWithWebSpeech,
+} from './utils/webSpeechFallback';
 
 const HISTORY_STORAGE_KEY = 'svara_studio_history_v1';
 const PRONUNCIATION_STORAGE_KEY = 'svara_pronunciations_v1';
+const CLONED_PRESETS_STORAGE_KEY = 'svara_cloned_presets_v1';
 const THEME_STORAGE_KEY = 'svara_theme_v1';
 const MAX_STORED_CLIPS = 100;
 
@@ -50,7 +60,6 @@ function saveHistory(items: HistoryItem[]): void {
   try {
     localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(capped));
   } catch {
-    // Keep newest 3 inline audio blobs and keep URL + wordTimings + waveformPeaks for the rest
     const compacted = capped.map((item, idx) =>
       idx < 3 ? item : { ...item, audioBase64: '' }
     );
@@ -72,6 +81,17 @@ function saveHistory(items: HistoryItem[]): void {
 function loadCachedPronunciations(): PronunciationEntry[] {
   try {
     const raw = localStorage.getItem(PRONUNCIATION_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadCachedClonedPresets(): SavedVoicePresetConfig[] {
+  try {
+    const raw = localStorage.getItem(CLONED_PRESETS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -111,6 +131,7 @@ export default function App() {
   const [normalizeAudio, setNormalizeAudio] = useState<boolean>(true);
   const [targetDurationSec, setTargetDurationSec] = useState<string>('');
   const [text, setText] = useState<string>(defaultTemplate.text);
+  const [activeClonePitchHz, setActiveClonePitchHz] = useState<number | undefined>(undefined);
 
   const [speakers, setSpeakers] = useState<{ A: SpeakerConfig; B: SpeakerConfig }>({
     A: {
@@ -132,13 +153,35 @@ export default function App() {
     loadCachedPronunciations()
   );
   const [isPronunciationModalOpen, setIsPronunciationModalOpen] = useState<boolean>(false);
-  const [savedPresets, setSavedPresets] = useState<SavedVoicePresetConfig[]>([]);
+  const [savedPresets, setSavedPresets] = useState<SavedVoicePresetConfig[]>(() =>
+    loadCachedClonedPresets()
+  );
 
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [regeneratingSegIdx, setRegeneratingSegIdx] = useState<number | null>(null);
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
+  const [isAuditioningClone, setIsAuditioningClone] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [serverAppUrl, setServerAppUrl] = useState<string | null>(null);
+
+  const [webSpeechVoicesCount, setWebSpeechVoicesCount] = useState<number>(0);
+  const [isCheckingHealth, setIsCheckingHealth] = useState<boolean>(false);
+  const [providerHealth, setProviderHealth] = useState<ProviderHealthSnapshot>(() => ({
+    ok: true,
+    browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    serverReachable: true,
+    webSpeechSupported: isWebSpeechSupported(),
+    providers: {
+      gemini: true,
+      openai: false,
+      elevenlabs: false,
+      keyless: true,
+    },
+    lastCheckedAt: null,
+    fallbackActive: false,
+    fallbackReason: null,
+    offlineReason: null,
+  }));
 
   const [history, setHistory] = useState<HistoryItem[]>(() => loadHistory());
   const [activeTrack, setActiveTrack] = useState<ActiveTrack | null>(null);
@@ -167,14 +210,120 @@ export default function App() {
   }, [pronunciations]);
 
   useEffect(() => {
-    fetch('/api/health')
-      .then((res) => res.json())
-      .then((data: { mcpEndpoint?: string }) => {
-        if (data?.mcpEndpoint) {
-          setServerAppUrl(data.mcpEndpoint.replace(/\/mcp$/, ''));
-        }
-      })
-      .catch(() => {});
+    try {
+      const clonesOnly = savedPresets.filter((p) => p.isClone || /^clone\b/i.test(p.name));
+      localStorage.setItem(CLONED_PRESETS_STORAGE_KEY, JSON.stringify(clonesOnly));
+    } catch {
+      // Ignore storage error
+    }
+  }, [savedPresets]);
+
+  const checkProviderHealth = useCallback(async (clearFallback = false) => {
+    const browserOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    setIsCheckingHealth(true);
+
+    if (isWebSpeechSupported()) {
+      getAvailableWebSpeechVoices(500)
+        .then((voices) => setWebSpeechVoicesCount(voices.length))
+        .catch(() => {});
+    }
+
+    if (!browserOnline) {
+      setProviderHealth((prev) => ({
+        ...prev,
+        ok: false,
+        browserOnline: false,
+        serverReachable: false,
+        webSpeechSupported: isWebSpeechSupported(),
+        lastCheckedAt: new Date().toISOString(),
+        fallbackActive: true,
+        offlineReason: 'Browser reports no active internet connection.',
+      }));
+      setIsCheckingHealth(false);
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/health', { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) {
+        throw new Error(`Health check returned HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as {
+        ok?: boolean;
+        version?: string;
+        build?: string;
+        mcpEndpoint?: string;
+        providers?: {
+          gemini?: boolean;
+          openai?: boolean;
+          elevenlabs?: boolean;
+          keyless?: boolean;
+        };
+      };
+      if (data?.mcpEndpoint) {
+        setServerAppUrl(data.mcpEndpoint.replace(/\/mcp$/, ''));
+      }
+      setProviderHealth((prev) => ({
+        ...prev,
+        ok: Boolean(data.ok),
+        browserOnline: true,
+        serverReachable: true,
+        webSpeechSupported: isWebSpeechSupported(),
+        providers: {
+          gemini: Boolean(data.providers?.gemini),
+          openai: Boolean(data.providers?.openai),
+          elevenlabs: Boolean(data.providers?.elevenlabs),
+          keyless: Boolean(data.providers?.keyless ?? true),
+        },
+        version: data.version,
+        build: data.build,
+        lastCheckedAt: new Date().toISOString(),
+        fallbackActive: clearFallback ? false : prev.fallbackActive,
+        fallbackReason: clearFallback ? null : prev.fallbackReason,
+        offlineReason: null,
+      }));
+    } catch (err) {
+      setProviderHealth((prev) => ({
+        ...prev,
+        ok: false,
+        browserOnline: true,
+        serverReachable: false,
+        webSpeechSupported: isWebSpeechSupported(),
+        lastCheckedAt: new Date().toISOString(),
+        fallbackActive: true,
+        offlineReason:
+          err instanceof Error
+            ? `Backend unreachable (${err.message}). Local Web Speech fallback active.`
+            : 'Backend unreachable. Local Web Speech fallback active.',
+      }));
+    } finally {
+      setIsCheckingHealth(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkProviderHealth(true);
+
+    const handleOnline = () => {
+      void checkProviderHealth(true);
+    };
+    const handleOffline = () => {
+      setProviderHealth((prev) => ({
+        ...prev,
+        ok: false,
+        browserOnline: false,
+        serverReachable: false,
+        fallbackActive: true,
+        offlineReason: 'Browser went offline. Switched to Offline Mode (Web Speech).',
+        lastCheckedAt: new Date().toISOString(),
+      }));
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    const interval = window.setInterval(() => {
+      void checkProviderHealth(false);
+    }, 60000);
 
     fetch('/api/pronunciations')
       .then((res) => res.json())
@@ -198,11 +347,25 @@ export default function App() {
       .then((res) => res.json())
       .then((data: { presets?: SavedVoicePresetConfig[] }) => {
         if (Array.isArray(data.presets)) {
-          setSavedPresets(data.presets);
+          setSavedPresets((prev) => {
+            const merged = [...data.presets!];
+            for (const localPreset of prev) {
+              if (!merged.some((p) => p.id === localPreset.id)) {
+                merged.push(localPreset);
+              }
+            }
+            return merged;
+          });
         }
       })
       .catch(() => {});
-  }, []);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      window.clearInterval(interval);
+    };
+  }, [checkProviderHealth]);
 
   const selectedVoice =
     VOICE_PRESETS.find((v) => v.id === selectedVoiceId) ?? VOICE_PRESETS[0];
@@ -213,6 +376,7 @@ export default function App() {
     setSelectedVoiceId(found.id);
     setStylePrompt(found.defaultStyle);
     setVoiceDesignMode('prebuilt');
+    setActiveClonePitchHz(undefined);
   };
 
   const handleUseVoiceInStudio = (voice: VoicePreset) => {
@@ -220,6 +384,7 @@ export default function App() {
     setStylePrompt(voice.defaultStyle);
     setLanguage(voice.sampleLanguage);
     setVoiceDesignMode('prebuilt');
+    setActiveClonePitchHz(undefined);
     if (!text.trim()) {
       setText(voice.sampleText);
     }
@@ -295,6 +460,7 @@ export default function App() {
     setSpeed(preset.speed);
     setPitchRegister(preset.pitchRegister);
     setEmotionIntensity(preset.emotionIntensity);
+    setActiveClonePitchHz(preset.cloneAcousticProfile?.pitchHz);
     if (preset.customVoiceDescription) {
       setVoiceDesignMode('custom');
       setCustomVoiceDescription(preset.customVoiceDescription);
@@ -331,10 +497,39 @@ export default function App() {
     }
   };
 
+  const handleSaveClonePreset = (
+    preset: SavedVoicePresetConfig,
+    allPresets?: SavedVoicePresetConfig[]
+  ) => {
+    if (Array.isArray(allPresets)) {
+      setSavedPresets(allPresets);
+    } else {
+      setSavedPresets((prev) => [preset, ...prev.filter((p) => p.id !== preset.id)]);
+    }
+  };
+
+  const handleDeletePreset = async (id: string) => {
+    setSavedPresets((prev) => prev.filter((p) => p.id !== id));
+    fetch(`/api/presets/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
+  };
+
+  const handleUseCloneInStudio = (preset: SavedVoicePresetConfig) => {
+    handleApplySavedPreset(preset.id);
+    setActiveTab('studio');
+    setErrorMessage(null);
+  };
+
   const pushGeneratedClip = (
     data: GenerateResponsePayload,
     fullScript: string,
-    voiceLabel: string
+    voiceLabel: string,
+    meta?: {
+      voiceId?: string;
+      voiceName?: SpeakerConfig['baseVoice'];
+      language?: LanguageMode;
+      pitchRegister?: PitchRegister;
+      clonePitchHz?: number;
+    }
   ) => {
     const previewSnippet =
       fullScript.length > 72 ? `${fullScript.slice(0, 72)}...` : fullScript;
@@ -346,16 +541,16 @@ export default function App() {
       downloadUrl: data.downloadUrl,
       createdAt: new Date().toISOString(),
       mode,
-      language,
+      language: meta?.language || language,
       voiceLabel,
-      voiceId: selectedVoice.id,
+      voiceId: meta?.voiceId || selectedVoice.id,
       textPreview: previewSnippet,
       fullText: fullScript,
       stylePrompt,
       customVoiceDescription:
         voiceDesignMode === 'custom' ? customVoiceDescription : undefined,
       speed,
-      pitchRegister,
+      pitchRegister: meta?.pitchRegister || pitchRegister,
       emotionIntensity,
       sampleRate: data.sampleRate || sampleRate,
       channels: data.channels || channels,
@@ -390,6 +585,13 @@ export default function App() {
       timingConfidence: data.timingConfidence,
       wordTimings: data.wordTimings,
       waveformPeaks: data.waveformPeaks,
+      isLocalWebSpeech: data.isLocalWebSpeech,
+      localSpeechScript: data.localSpeechScript,
+      voiceId: meta?.voiceId || selectedVoice.id,
+      voiceName: meta?.voiceName || selectedVoice.baseVoice,
+      language: meta?.language || language,
+      pitchRegister: meta?.pitchRegister || pitchRegister,
+      clonePitchHz: meta?.clonePitchHz ?? activeClonePitchHz,
     });
   };
 
@@ -422,34 +624,153 @@ export default function App() {
       dialogueLines: mode === 'multi' ? dialogueLines : undefined,
     };
 
+    const fullScript =
+      mode === 'multi'
+        ? dialogueLines
+            .filter((l) => l.text.trim())
+            .map((l) => `${l.speakerKey === 'A' ? speakers.A.name : speakers.B.name}: ${l.text}`)
+            .join(' ')
+        : text.trim();
+
+    const voiceLabel =
+      mode === 'multi'
+        ? `${speakers.A.name} & ${speakers.B.name}`
+        : voiceDesignMode === 'custom' && customVoiceDescription.trim()
+          ? 'Custom Voice Design'
+          : `${selectedVoice.name} (${selectedVoice.roleTitle})`;
+
     setErrorMessage(null);
     setIsGenerating(true);
 
     try {
+      if (engineTier === 'webspeech' || !providerHealth.browserOnline) {
+        const wsData = await synthesizeWithWebSpeech(payload, {
+          clonePitchHz: activeClonePitchHz,
+          fallbackReason:
+            engineTier === 'webspeech'
+              ? 'Browser OS Voices engine selected'
+              : 'Browser offline — synthesized via local Web Speech API',
+        });
+        setProviderHealth((prev) => ({
+          ...prev,
+          fallbackActive: true,
+          fallbackReason: wsData.fallbackReason || null,
+        }));
+        pushGeneratedClip(wsData, fullScript, voiceLabel);
+        return;
+      }
+
       const data = await generate(payload);
-
-      const fullScript =
-        mode === 'multi'
-          ? dialogueLines
-              .filter((l) => l.text.trim())
-              .map((l) => `${l.speakerKey === 'A' ? speakers.A.name : speakers.B.name}: ${l.text}`)
-              .join(' ')
-          : text.trim();
-
-      const voiceLabel =
-        mode === 'multi'
-          ? `${speakers.A.name} & ${speakers.B.name}`
-          : voiceDesignMode === 'custom' && customVoiceDescription.trim()
-            ? 'Custom Voice Design'
-            : `${selectedVoice.name} (${selectedVoice.roleTitle})`;
-
+      setProviderHealth((prev) => ({
+        ...prev,
+        ok: true,
+        serverReachable: true,
+        fallbackActive: false,
+        fallbackReason: null,
+        offlineReason: null,
+      }));
       pushGeneratedClip(data, fullScript, voiceLabel);
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Unable to generate speech right now.'
-      );
+      const errMsg = err instanceof Error ? err.message : 'Unable to generate speech right now.';
+      if (isWebSpeechSupported() && fullScript.trim().length > 0) {
+        try {
+          const wsData = await synthesizeWithWebSpeech(payload, {
+            clonePitchHz: activeClonePitchHz,
+            fallbackReason: `Cloud & keyless engines unavailable (${errMsg}). Switched to Offline Mode (Web Speech).`,
+          });
+          setProviderHealth((prev) => ({
+            ...prev,
+            fallbackActive: true,
+            fallbackReason: wsData.fallbackReason || errMsg,
+            lastCheckedAt: new Date().toISOString(),
+          }));
+          pushGeneratedClip(wsData, fullScript, voiceLabel);
+          return;
+        } catch {
+          // Fall through to error message if script itself is invalid/empty
+        }
+      }
+      setErrorMessage(errMsg);
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const handleAuditionClone = async (
+    preset: SavedVoicePresetConfig,
+    auditionText: string
+  ) => {
+    const baseVoice =
+      VOICE_PRESETS.find((v) => v.id === preset.voiceId)?.baseVoice ||
+      preset.cloneAcousticProfile?.matchedBaseVoiceName ||
+      'Puck';
+
+    const payload: GenerateRequestPayload = {
+      mode: 'single',
+      language: preset.language,
+      modelTier: engineTier,
+      text: auditionText,
+      voiceId: preset.voiceId,
+      voiceName: baseVoice,
+      stylePrompt: preset.stylePrompt,
+      customVoiceDescription: preset.customVoiceDescription,
+      speed: preset.speed,
+      pitchRegister: preset.pitchRegister,
+      emotionIntensity: preset.emotionIntensity,
+      expressiveControls: preset.expressiveControls,
+      format: 'wav',
+      sampleRate: preset.sampleRate || 48000,
+      channels: preset.channels || 1,
+      masteringPreset: preset.masteringPreset || 'podcast',
+      normalize: true,
+      trimSilence: true,
+      pronunciationRules: pronunciations,
+    };
+
+    setIsAuditioningClone(true);
+    setErrorMessage(null);
+    try {
+      const data =
+        engineTier === 'webspeech' || !providerHealth.browserOnline
+          ? await synthesizeWithWebSpeech(payload, {
+              clonePitchHz: preset.cloneAcousticProfile?.pitchHz,
+              fallbackReason: 'Auditioned locally via Browser OS Web Speech (Offline Mode)',
+            })
+          : await generate(payload);
+
+      pushGeneratedClip(data, auditionText.trim(), preset.name, {
+        voiceId: preset.voiceId,
+        voiceName: baseVoice,
+        language: preset.language,
+        pitchRegister: preset.pitchRegister,
+        clonePitchHz: preset.cloneAcousticProfile?.pitchHz,
+      });
+    } catch (err) {
+      if (isWebSpeechSupported()) {
+        const wsData = await synthesizeWithWebSpeech(payload, {
+          clonePitchHz: preset.cloneAcousticProfile?.pitchHz,
+          fallbackReason:
+            err instanceof Error
+              ? `Cloud unreachable (${err.message}); auditioning via Browser Web Speech.`
+              : 'Auditioning via Browser Web Speech.',
+        });
+        setProviderHealth((prev) => ({
+          ...prev,
+          fallbackActive: true,
+          fallbackReason: wsData.fallbackReason || null,
+        }));
+        pushGeneratedClip(wsData, auditionText.trim(), preset.name, {
+          voiceId: preset.voiceId,
+          voiceName: baseVoice,
+          language: preset.language,
+          pitchRegister: preset.pitchRegister,
+          clonePitchHz: preset.cloneAcousticProfile?.pitchHz,
+        });
+      } else {
+        setErrorMessage(err instanceof Error ? err.message : 'Unable to audition cloned voice.');
+      }
+    } finally {
+      setIsAuditioningClone(false);
     }
   };
 
@@ -484,21 +805,25 @@ export default function App() {
   const handlePreviewVoice = async (voice: VoicePreset) => {
     setPreviewingVoiceId(voice.id);
     setErrorMessage(null);
+    const payload: GenerateRequestPayload = {
+      mode: 'single',
+      language: voice.sampleLanguage,
+      modelTier: engineTier === 'webspeech' ? 'webspeech' : 'standard',
+      text: voice.sampleText,
+      voiceId: voice.id,
+      voiceName: voice.baseVoice,
+      stylePrompt: voice.defaultStyle,
+      speed: 1.0,
+      sampleRate: 48000,
+      channels: 1,
+      pronunciationRules: pronunciations,
+    };
+
     try {
-      const payload: GenerateRequestPayload = {
-        mode: 'single',
-        language: voice.sampleLanguage,
-        modelTier: 'standard',
-        text: voice.sampleText,
-        voiceId: voice.id,
-        voiceName: voice.baseVoice,
-        stylePrompt: voice.defaultStyle,
-        speed: 1.0,
-        sampleRate: 48000,
-        channels: 1,
-        pronunciationRules: pronunciations,
-      };
-      const data = await generate(payload);
+      const data =
+        engineTier === 'webspeech' || !providerHealth.browserOnline
+          ? await synthesizeWithWebSpeech(payload)
+          : await generate(payload);
 
       setActiveTrack({
         id: `preview-${voice.id}-${Date.now()}`,
@@ -508,24 +833,60 @@ export default function App() {
         audioBase64: data.audioBase64,
         audioUrl: data.audioUrl,
         downloadUrl: data.downloadUrl,
-      durationSec: data.durationEstimateSec,
-      sampleRate: data.sampleRate || 48000,
-      channels: data.channels || 1,
-      timingSource: data.timingSource,
-      timingConfidence: data.timingConfidence,
-      wordTimings: data.wordTimings,
-      waveformPeaks: data.waveformPeaks,
-    });
-  } catch (err) {
-    setErrorMessage(
-      err instanceof Error ? err.message : 'Unable to preview voice sample.'
-    );
-  } finally {
-    setPreviewingVoiceId(null);
-  }
+        durationSec: data.durationEstimateSec,
+        sampleRate: data.sampleRate || 48000,
+        channels: data.channels || 1,
+        timingSource: data.timingSource,
+        timingConfidence: data.timingConfidence,
+        wordTimings: data.wordTimings,
+        waveformPeaks: data.waveformPeaks,
+        isLocalWebSpeech: data.isLocalWebSpeech,
+        localSpeechScript: data.localSpeechScript,
+        voiceId: voice.id,
+        voiceName: voice.baseVoice,
+        language: voice.sampleLanguage,
+      });
+    } catch (err) {
+      if (isWebSpeechSupported()) {
+        const wsData = await synthesizeWithWebSpeech(payload, {
+          fallbackReason:
+            err instanceof Error ? err.message : 'Preview switched to Offline Web Speech.',
+        });
+        setProviderHealth((prev) => ({
+          ...prev,
+          fallbackActive: true,
+          fallbackReason: wsData.fallbackReason || null,
+        }));
+        setActiveTrack({
+          id: `preview-${voice.id}-${Date.now()}`,
+          clipId: wsData.clipId,
+          title: `${voice.name} — ${voice.roleTitle}`,
+          subtitle: `${voice.language} Sample · Browser OS Voice`,
+          audioBase64: '',
+          durationSec: wsData.durationEstimateSec,
+          timingSource: wsData.timingSource,
+          timingConfidence: wsData.timingConfidence,
+          wordTimings: wsData.wordTimings,
+          waveformPeaks: wsData.waveformPeaks,
+          isLocalWebSpeech: true,
+          localSpeechScript: wsData.localSpeechScript,
+          voiceId: voice.id,
+          voiceName: voice.baseVoice,
+          language: voice.sampleLanguage,
+        });
+      } else {
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Unable to preview voice sample.'
+        );
+      }
+    } finally {
+      setPreviewingVoiceId(null);
+    }
   };
 
   const handlePlayHistoryItem = (item: HistoryItem) => {
+    const isWebSpeech = item.modelUsed === 'webspeech:os-voice' && !item.audioBase64;
+    const matchedVoice = VOICE_PRESETS.find((v) => v.id === item.voiceId);
     setActiveTrack({
       id: item.id,
       clipId: item.clipId,
@@ -541,6 +902,12 @@ export default function App() {
       timingConfidence: item.timingConfidence,
       wordTimings: item.wordTimings,
       waveformPeaks: item.waveformPeaks,
+      isLocalWebSpeech: isWebSpeech,
+      localSpeechScript: isWebSpeech ? stripTagsForWebSpeech(item.fullText) : undefined,
+      voiceId: item.voiceId,
+      voiceName: matchedVoice?.baseVoice,
+      language: item.language,
+      pitchRegister: item.pitchRegister,
     });
   };
 
@@ -579,18 +946,22 @@ export default function App() {
         : 'Studio / Speech Synthesis'
       : activeTab === 'voices'
         ? 'Library / English & Hindi Voices'
-        : activeTab === 'history'
-          ? 'Archive / Generation History'
-          : 'Integrations / ChatGPT & Claude MCP';
+        : activeTab === 'cloning'
+          ? 'Lab / 30s Voice Cloning'
+          : activeTab === 'history'
+            ? 'Archive / Generation History'
+            : 'Integrations / ChatGPT & Claude MCP';
 
   const pageTitle =
     activeTab === 'studio'
       ? 'Text to Speech Studio'
       : activeTab === 'voices'
         ? 'Voice Library'
-        : activeTab === 'history'
-          ? 'Generation History'
-          : 'MCP Connectors';
+        : activeTab === 'cloning'
+          ? 'Voice Cloning'
+          : activeTab === 'history'
+            ? 'Generation History'
+            : 'MCP Connectors';
 
   return (
     <div className="h-dvh overflow-hidden flex flex-col bg-[#F8FAFC] dark:bg-[#090D16] text-[#0F172A] dark:text-slate-100">
@@ -650,6 +1021,17 @@ export default function App() {
               </button>
               <button
                 type="button"
+                onClick={() => setActiveTab('cloning')}
+                className={`whitespace-nowrap shrink-0 ${
+                  activeTab === 'cloning'
+                    ? 'text-[#0F172A] dark:text-white underline underline-offset-4'
+                    : ''
+                }`}
+              >
+                Cloning
+              </button>
+              <button
+                type="button"
                 onClick={() => setActiveTab('history')}
                 className={`whitespace-nowrap shrink-0 ${
                   activeTab === 'history'
@@ -673,6 +1055,26 @@ export default function App() {
             </nav>
 
             <div className="flex items-center gap-2 shrink-0">
+              <ConnectionStatusBadge
+                health={providerHealth}
+                engineTier={engineTier}
+                voiceCount={webSpeechVoicesCount}
+                isChecking={isCheckingHealth}
+                onRecheck={() => void checkProviderHealth(true)}
+                onSelectEngineTier={(tier) => {
+                  setEngineTier(tier);
+                  if (tier === 'webspeech') {
+                    setProviderHealth((prev) => ({
+                      ...prev,
+                      fallbackActive: true,
+                      fallbackReason: 'Manual Browser OS Voices (Offline Mode) active.',
+                    }));
+                  } else {
+                    void checkProviderHealth(true);
+                  }
+                }}
+              />
+
               <button
                 type="button"
                 onClick={() => setIsDark((prev) => !prev)}
@@ -703,12 +1105,14 @@ export default function App() {
                   </h1>
                   <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
                     {activeTab === 'studio'
-                      ? 'Synthesize expressive speech in English, हिन्दी (Hindi), and Hinglish with custom pronunciations, 48 kHz WAV mastering, and word-level captions.'
+                      ? 'Synthesize expressive speech in English, हिन्दी (Hindi), and Hinglish with custom pronunciations, 48 kHz WAV mastering, word-level captions, and offline OS fallback.'
                       : activeTab === 'voices'
                         ? 'Explore curated English, Hindi, and bilingual voices—preview samples live or open directly in the studio.'
-                        : activeTab === 'history'
-                          ? 'Replay, restore, or download your synthesized .WAV audio files and .SRT / .ASS captions.'
-                          : 'Connect ChatGPT and Claude directly to Svara Studio over Model Context Protocol (/mcp).'}
+                        : activeTab === 'cloning'
+                          ? 'Record 30 seconds of your own voice via microphone or upload an audio clip to generate a persistent Clone preset and audition it live.'
+                          : activeTab === 'history'
+                            ? 'Replay, restore, or download your synthesized .WAV audio files and .SRT / .ASS captions.'
+                            : 'Connect ChatGPT and Claude directly to Svara Studio over Model Context Protocol (/mcp).'}
                   </p>
                 </div>
               </div>
@@ -735,7 +1139,22 @@ export default function App() {
                   emotionIntensity={emotionIntensity}
                   onEmotionIntensityChange={setEmotionIntensity}
                   engineTier={engineTier}
-                  onEngineTierChange={setEngineTier}
+                  onEngineTierChange={(tier) => {
+                    setEngineTier(tier);
+                    if (tier === 'webspeech') {
+                      setProviderHealth((prev) => ({
+                        ...prev,
+                        fallbackActive: true,
+                        fallbackReason: 'Manual Browser OS Voices (Offline Mode) selected.',
+                      }));
+                    } else if (providerHealth.browserOnline && providerHealth.serverReachable) {
+                      setProviderHealth((prev) => ({
+                        ...prev,
+                        fallbackActive: false,
+                        fallbackReason: null,
+                      }));
+                    }
+                  }}
                   sampleRate={sampleRate}
                   onSampleRateChange={setSampleRate}
                   channels={channels}
@@ -762,7 +1181,8 @@ export default function App() {
                   playbackCurrentTime={playback.currentTime}
                   playbackDuration={playback.duration}
                   isPlaying={playback.isPlaying}
-                  hasAudio={Boolean(playback.audioSrc)}
+                  hasAudio={Boolean(playback.audioSrc || activeTrack?.isLocalWebSpeech)}
+                  isDark={isDark}
                   onTogglePlay={playback.togglePlay}
                   onSeek={playback.seekTo}
                   regeneratingSegIdx={regeneratingSegIdx}
@@ -800,11 +1220,23 @@ export default function App() {
                 </>
               )}
 
+              {activeTab === 'cloning' && (
+                <VoiceCloningTab
+                  savedPresets={savedPresets}
+                  isAuditioning={isAuditioningClone}
+                  onSaveClonePreset={handleSaveClonePreset}
+                  onDeletePreset={handleDeletePreset}
+                  onAuditionClone={handleAuditionClone}
+                  onUseCloneInStudio={handleUseCloneInStudio}
+                />
+              )}
+
               {activeTab === 'history' && (
                 <HistoryPanel
                   items={history}
                   activeTrackId={activeTrack?.id ?? null}
                   playback={playback}
+                  isDark={isDark}
                   onPlayItem={handlePlayHistoryItem}
                   onRestoreToStudio={handleRestoreToStudio}
                   onDeleteItem={(id) =>
@@ -822,7 +1254,7 @@ export default function App() {
           <AudioPlayerBar
             track={activeTrack}
             playback={playback}
-            isGenerating={isGenerating || previewingVoiceId !== null}
+            isGenerating={isGenerating || previewingVoiceId !== null || isAuditioningClone}
             isDark={isDark}
           />
         </div>
